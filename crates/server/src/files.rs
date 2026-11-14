@@ -157,6 +157,17 @@ pub async fn upload_chunk(
         ));
     }
 
+    let new_end = q
+        .offset
+        .checked_add(body.len() as u64)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "chunk offset overflow"))?;
+    if new_end > q.total_size {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("chunk end {new_end} exceeds total_size {}", q.total_size),
+        ));
+    }
+
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -171,14 +182,6 @@ pub async fn upload_chunk(
     file.write_all(&body)
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let new_end = q.offset + body.len() as u64;
-    if new_end > q.total_size {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            format!("chunk end {new_end} exceeds total_size {}", q.total_size),
-        ));
-    }
 
     file.set_len(new_end)
         .await

@@ -1,11 +1,14 @@
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use clap::Parser;
 use offload_client::OffloadClient;
 use offload_protocol::{DEFAULT_DISCOVERY_PORT, TaskKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    sync::mpsc,
+};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -51,10 +54,17 @@ struct JsonRpcError {
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let cli = Arc::new(Cli::parse());
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
-    let mut stdout = tokio::io::stdout();
+    let (tx, mut rx) = mpsc::channel::<JsonRpcResponse>(128);
+
+    let writer_task = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(resp) = rx.recv().await {
+            write_response(&mut stdout, &resp).await;
+        }
+    });
 
     while let Ok(Some(line)) = lines.next_line().await {
         let trimmed = line.trim();
@@ -74,7 +84,9 @@ async fn main() {
                         message: format!("parse error: {err}"),
                     }),
                 };
-                write_response(&mut stdout, &resp).await;
+                if tx.send(resp).await.is_err() {
+                    break;
+                }
                 continue;
             }
         };
@@ -84,9 +96,16 @@ async fn main() {
             continue;
         };
 
-        let resp = handle_request(&cli, id, &req.method, req.params).await;
-        write_response(&mut stdout, &resp).await;
+        let cli = Arc::clone(&cli);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let resp = handle_request(&cli, id, &req.method, req.params).await;
+            let _ = tx.send(resp).await;
+        });
     }
+
+    drop(tx);
+    let _ = writer_task.await;
 }
 
 async fn write_response(stdout: &mut tokio::io::Stdout, resp: &JsonRpcResponse) {

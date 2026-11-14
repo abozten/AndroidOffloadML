@@ -99,7 +99,11 @@ impl AppState {
     pub async fn set_abort_handle(&self, id: Uuid, handle: AbortHandle) {
         let mut store = self.jobs.write().await;
         if let Some(entry) = store.entries.get_mut(&id) {
-            entry.abort_handle = Some(handle);
+            if entry.record.status == JobStatus::Cancelled {
+                handle.abort();
+            } else if !is_terminal(entry.record.status) {
+                entry.abort_handle = Some(handle);
+            }
         }
     }
 
@@ -115,6 +119,9 @@ impl AppState {
     pub async fn mark_succeeded(&self, id: Uuid, duration_ms: u64, result: TaskResult) {
         let mut store = self.jobs.write().await;
         if let Some(entry) = store.entries.get_mut(&id) {
+            if is_terminal(entry.record.status) {
+                return;
+            }
             entry.record.status = JobStatus::Succeeded;
             entry.record.duration_ms = Some(duration_ms);
             entry.record.result = Some(result);
@@ -131,6 +138,9 @@ impl AppState {
     pub async fn mark_failed(&self, id: Uuid, duration_ms: u64, error: String) {
         let mut store = self.jobs.write().await;
         if let Some(entry) = store.entries.get_mut(&id) {
+            if is_terminal(entry.record.status) {
+                return;
+            }
             entry.record.status = JobStatus::Failed;
             entry.record.duration_ms = Some(duration_ms);
             entry.record.result = None;
@@ -193,9 +203,47 @@ impl AppState {
     }
 }
 
+fn is_terminal(status: JobStatus) -> bool {
+    matches!(
+        status,
+        JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
+    )
+}
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mark_succeeded_and_failed_do_not_overwrite_cancelled() {
+        let state = AppState::new(ServerConfig {
+            auth_token: None,
+            max_concurrent_jobs: 1,
+            models_dir: None,
+            files_dir: PathBuf::from("uploads"),
+            llama_bin: "llama-cli".into(),
+            allowed_commands: vec![],
+            default_timeout_secs: 60,
+        });
+
+        let (rec, _) = state.create_job().await;
+        let cancelled = state.cancel_job(rec.id).await.unwrap();
+        assert_eq!(cancelled.status, JobStatus::Cancelled);
+
+        state
+            .mark_succeeded(rec.id, 10, TaskResult::Echo { payload: "ok".into() })
+            .await;
+        state.mark_failed(rec.id, 10, "err".into()).await;
+
+        let after = state.get_job(rec.id).await.unwrap();
+        assert_eq!(after.status, JobStatus::Cancelled);
+        assert!(after.result.is_none());
+    }
 }

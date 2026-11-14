@@ -68,7 +68,8 @@ pub struct OffloadClient {
 impl OffloadClient {
     pub fn new(base_url: impl Into<String>, token: Option<String>) -> Result<Self, ClientError> {
         let http = Client::builder()
-            .timeout(Duration::from_secs(600))
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(60))
             .build()?;
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -138,12 +139,12 @@ impl OffloadClient {
             return Err(extract_api_error(res).await);
         }
 
-        let mut buf = String::new();
+        let mut buf = Vec::<u8>::new();
         while let Some(chunk) = res.chunk().await? {
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim_end_matches('\r').to_string();
-                buf.drain(..=pos);
+            buf.extend_from_slice(&chunk);
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line = String::from_utf8_lossy(&buf[..pos]);
+                let line = line.trim_end_matches('\r');
                 if let Some(data) = line.strip_prefix("data:") {
                     let payload = data.trim();
                     if let Ok(ev) = serde_json::from_str::<JobStreamEvent>(payload) {
@@ -154,6 +155,7 @@ impl OffloadClient {
                         }
                     }
                 }
+                buf.drain(..=pos);
             }
         }
         Ok(())
@@ -221,8 +223,13 @@ impl OffloadClient {
         loop {
             let chunk_start = Instant::now();
             let n = read_full_chunk(&mut file, &mut buf).await?;
-            if n == 0 && total_bytes > 0 && offset >= total_bytes {
-                break;
+            if n == 0 && offset < total_bytes {
+                return Err(ClientError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "local file shrunk during upload: read 0 bytes at offset {offset} of {total_bytes}"
+                    ),
+                )));
             }
 
             let req = self
@@ -335,7 +342,7 @@ impl OffloadClient {
         if offset > total_bytes {
             offset = 0;
         }
-        let resumed_bytes = offset;
+        let mut resumed_bytes = offset;
 
         let mut out_file = OpenOptions::new()
             .create(true)
@@ -356,6 +363,12 @@ impl OffloadClient {
         let mut res = req.send().await?;
         if !res.status().is_success() {
             return Err(extract_api_error(res).await);
+        }
+        if res.status() == StatusCode::OK && offset > 0 {
+            offset = 0;
+            resumed_bytes = 0;
+            out_file.set_len(0).await?;
+            out_file.seek(SeekFrom::Start(0)).await?;
         }
 
         let mut ema_speed_bps = 0.0_f64;
@@ -402,6 +415,7 @@ impl OffloadClient {
         if let Some(expected) = status.blake3 {
             let actual = compute_blake3_blocking(&part_path).await?;
             if actual != expected {
+                let _ = fs::remove_file(&part_path).await;
                 return Err(ClientError::ChecksumMismatch { expected, actual });
             }
         }

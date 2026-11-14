@@ -1,9 +1,64 @@
 use std::{
-    cmp::Ordering,
     path::{Component, Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
+
+const MAX_MATMUL_OUTPUT_ELEMENTS: usize = 64 * 1024 * 1024;
+const MAX_COLLECTED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+const ALLOWED_LLAMA_VALUE_FLAGS: &[&str] = &[
+    "-c",
+    "--ctx-size",
+    "-t",
+    "--threads",
+    "-tb",
+    "--threads-batch",
+    "-b",
+    "--batch-size",
+    "-ub",
+    "--ubatch-size",
+    "--top-k",
+    "--top-p",
+    "--min-p",
+    "--typical",
+    "--repeat-penalty",
+    "--repeat-last-n",
+    "--presence-penalty",
+    "--frequency-penalty",
+    "--mirostat",
+    "--mirostat-lr",
+    "--mirostat-ent",
+    "-s",
+    "--seed",
+    "-ngl",
+    "--n-gpu-layers",
+    "--keep",
+    "--temp",
+    "-n",
+    "--predict",
+    "--n-predict",
+    "--cache-type-k",
+    "--cache-type-v",
+    "-fa",
+    "--flash-attn",
+    "--rope-freq-base",
+    "--rope-freq-scale",
+];
+
+const ALLOWED_LLAMA_BOOL_FLAGS: &[&str] = &[
+    "--no-display-prompt",
+    "--simple-io",
+    "--ignore-eos",
+    "--no-mmap",
+    "--mlock",
+    "--color",
+    "--no-warmup",
+    "-e",
+    "--escape",
+    "--no-escape",
+    "--verbose-prompt",
+];
 
 use offload_protocol::{JobStreamEvent, SimilarityMatch, TaskKind, TaskResult};
 use thiserror::Error;
@@ -77,6 +132,7 @@ pub async fn execute_task(
                 args.push("--temp".to_string());
                 args.push(temp.to_string());
             }
+            validate_llama_extra_args(&extra_args)?;
             args.extend(extra_args);
 
             run_subprocess(
@@ -149,7 +205,16 @@ fn run_matmul(
         )));
     }
 
-    let mut out = vec![0.0_f32; rows_a * cols_b];
+    let out_elems = rows_a
+        .checked_mul(cols_b)
+        .ok_or_else(|| RunnerError::InvalidInput("output matrix dimensions overflow".into()))?;
+    if out_elems > MAX_MATMUL_OUTPUT_ELEMENTS {
+        return Err(RunnerError::InvalidInput(format!(
+            "output matrix size {out_elems} exceeds limit of {MAX_MATMUL_OUTPUT_ELEMENTS} elements"
+        )));
+    }
+
+    let mut out = vec![0.0_f32; out_elems];
     // ikj loop order keeps row slices of B and out contiguous for cache locality.
     for i in 0..rows_a {
         let a_row = &a[i * cols_a..(i + 1) * cols_a];
@@ -207,8 +272,7 @@ fn run_cosine_top_k(
 
     scored.sort_by(|lhs, rhs| {
         rhs.score
-            .partial_cmp(&lhs.score)
-            .unwrap_or(Ordering::Equal)
+            .total_cmp(&lhs.score)
             .then_with(|| lhs.index.cmp(&rhs.index))
     });
     scored.truncate(top_k);
@@ -248,6 +312,46 @@ pub fn resolve_model_path(model: &str, models_dir: Option<&Path>) -> Result<Path
         }
         None => Ok(rel.to_path_buf()),
     }
+}
+
+pub fn validate_llama_extra_args(extra_args: &[String]) -> Result<(), RunnerError> {
+    let mut i = 0;
+    while i < extra_args.len() {
+        let arg = &extra_args[i];
+        if !arg.starts_with('-') {
+            return Err(RunnerError::Forbidden(format!(
+                "positional llama extra arg '{arg}' is not allowed"
+            )));
+        }
+        let (flag, inline_val) = match arg.split_once('=') {
+            Some((f, v)) => (f, Some(v)),
+            None => (arg.as_str(), None),
+        };
+        if ALLOWED_LLAMA_VALUE_FLAGS.contains(&flag) {
+            let val = match inline_val {
+                Some(v) => v,
+                None => {
+                    i += 1;
+                    extra_args.get(i).map(String::as_str).ok_or_else(|| {
+                        RunnerError::InvalidInput(format!("llama extra arg '{flag}' requires a value"))
+                    })?
+                }
+            };
+            if val.is_empty() || val.contains('/') || val.contains('\\') || val.contains("..") {
+                return Err(RunnerError::Forbidden(format!(
+                    "invalid value for llama extra arg '{flag}'"
+                )));
+            }
+        } else if ALLOWED_LLAMA_BOOL_FLAGS.contains(&flag) && inline_val.is_none() {
+            // Allowed boolean flag.
+        } else {
+            return Err(RunnerError::Forbidden(format!(
+                "llama extra arg '{flag}' is not allowed"
+            )));
+        }
+        i += 1;
+    }
+    Ok(())
 }
 
 pub fn is_command_allowed(program: &str, allowed_commands: &[String]) -> bool {
@@ -292,47 +396,8 @@ async fn run_subprocess(
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
 
-    let tx_out = stream_tx.clone();
-    let out_task = tokio::spawn(async move {
-        let mut collected = String::new();
-        if let Some(pipe) = stdout_pipe {
-            let mut lines = BufReader::new(pipe).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(tx) = &tx_out {
-                    let _ = tx.send(JobStreamEvent::Output {
-                        stream: "stdout".to_string(),
-                        line: line.clone(),
-                    });
-                }
-                if !collected.is_empty() {
-                    collected.push('\n');
-                }
-                collected.push_str(&line);
-            }
-        }
-        collected
-    });
-
-    let tx_err = stream_tx;
-    let err_task = tokio::spawn(async move {
-        let mut collected = String::new();
-        if let Some(pipe) = stderr_pipe {
-            let mut lines = BufReader::new(pipe).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(tx) = &tx_err {
-                    let _ = tx.send(JobStreamEvent::Output {
-                        stream: "stderr".to_string(),
-                        line: line.clone(),
-                    });
-                }
-                if !collected.is_empty() {
-                    collected.push('\n');
-                }
-                collected.push_str(&line);
-            }
-        }
-        collected
-    });
+    let out_task = tokio::spawn(read_pipe_lines(stdout_pipe, "stdout", stream_tx.clone()));
+    let err_task = tokio::spawn(read_pipe_lines(stderr_pipe, "stderr", stream_tx));
 
     let status = timeout(limit, child.wait())
         .await
@@ -360,6 +425,73 @@ async fn run_subprocess(
         exit_code,
         stderr,
     })
+}
+
+async fn read_pipe_lines<R>(
+    pipe: Option<R>,
+    stream_name: &'static str,
+    tx: Option<broadcast::Sender<JobStreamEvent>>,
+) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut collected = String::new();
+    let Some(pipe) = pipe else {
+        return collected;
+    };
+
+    let mut reader = BufReader::new(pipe);
+    let mut raw_line = Vec::new();
+    let mut truncated = false;
+
+    loop {
+        raw_line.clear();
+        match reader.read_until(b'\n', &mut raw_line).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+
+        if raw_line.last() == Some(&b'\n') {
+            raw_line.pop();
+            if raw_line.last() == Some(&b'\r') {
+                raw_line.pop();
+            }
+        }
+
+        let line = String::from_utf8_lossy(&raw_line).into_owned();
+        if let Some(tx) = &tx {
+            let _ = tx.send(JobStreamEvent::Output {
+                stream: stream_name.to_string(),
+                line: line.clone(),
+            });
+        }
+
+        if !truncated {
+            let sep_len = usize::from(!collected.is_empty());
+            if collected.len() + sep_len + line.len() <= MAX_COLLECTED_OUTPUT_BYTES {
+                if sep_len > 0 {
+                    collected.push('\n');
+                }
+                collected.push_str(&line);
+            } else {
+                let remaining = MAX_COLLECTED_OUTPUT_BYTES.saturating_sub(collected.len() + sep_len);
+                if remaining > 0 {
+                    if sep_len > 0 {
+                        collected.push('\n');
+                    }
+                    let mut end = remaining.min(line.len());
+                    while end > 0 && !line.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    collected.push_str(&line[..end]);
+                }
+                collected.push_str("\n... [output truncated]");
+                truncated = true;
+            }
+        }
+    }
+
+    collected
 }
 
 #[cfg(test)]
@@ -414,5 +546,49 @@ mod tests {
         assert!(is_command_allowed("python3", &allowed));
         assert!(!is_command_allowed("sh", &allowed));
         assert!(!is_command_allowed("", &allowed));
+    }
+
+    #[test]
+    fn matmul_rejects_oversized_output() {
+        let a = vec![1.0_f32; 10_000];
+        let b = vec![1.0_f32; 10_000];
+        let err = run_matmul(10_000, 1, 10_000, &a, &b).unwrap_err();
+        assert!(matches!(err, RunnerError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn cosine_top_k_handles_nan_without_panicking() {
+        let query = vec![1.0_f32, 0.0];
+        let corpus = vec![vec![f32::INFINITY, 1.0], vec![1.0, 0.0], vec![0.5, 0.5]];
+        let res = run_cosine_top_k(&query, &corpus, 3).unwrap();
+        match res {
+            TaskResult::CosineTopK { matches } => assert_eq!(matches.len(), 3),
+            _ => panic!("unexpected result variant"),
+        }
+    }
+
+    #[test]
+    fn validate_llama_extra_args_blocks_paths_and_model_flags() {
+        assert!(
+            validate_llama_extra_args(&[
+                "--temp".into(),
+                "0.7".into(),
+                "--ctx-size=4096".into(),
+                "--simple-io".into(),
+            ])
+            .is_ok()
+        );
+        assert!(validate_llama_extra_args(&["-m".into(), "/etc/passwd".into()]).is_err());
+        assert!(validate_llama_extra_args(&["--model=/etc/passwd".into()]).is_err());
+        assert!(validate_llama_extra_args(&["--log-file".into(), "/tmp/out".into()]).is_err());
+        assert!(validate_llama_extra_args(&["/etc/passwd".into()]).is_err());
+        assert!(validate_llama_extra_args(&["--ctx-size".into(), "../foo".into()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn read_pipe_lines_handles_non_utf8_bytes() {
+        let data: &[u8] = b"first line\nhello \xff\xfe world\nthird line\n";
+        let output = read_pipe_lines(Some(data), "stdout", None).await;
+        assert_eq!(output, "first line\nhello \u{FFFD}\u{FFFD} world\nthird line");
     }
 }

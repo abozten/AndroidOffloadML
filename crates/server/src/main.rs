@@ -170,7 +170,7 @@ async fn auth_middleware(
 
     let authorized = auth_header
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|token| token == expected);
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()));
 
     if !authorized {
         return Err(ApiError::new(
@@ -180,6 +180,17 @@ async fn auth_middleware(
     }
 
     Ok(next.run(req).await)
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0_u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
 }
 
 async fn health() -> impl IntoResponse {
@@ -368,15 +379,21 @@ async fn stream_job(
             return;
         }
 
-        while let Ok(ev) = rx.recv().await {
-            let is_done = matches!(ev, JobStreamEvent::Done { .. });
-            if let Ok(json) = serde_json::to_string(&ev)
-                && tx.send(Ok(Event::default().data(json))).await.is_err()
-            {
-                break;
-            }
-            if is_done {
-                break;
+        loop {
+            match rx.recv().await {
+                Ok(ev) => {
+                    let is_done = matches!(ev, JobStreamEvent::Done { .. });
+                    if let Ok(json) = serde_json::to_string(&ev)
+                        && tx.send(Ok(Event::default().data(json))).await.is_err()
+                    {
+                        break;
+                    }
+                    if is_done {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });
