@@ -24,10 +24,10 @@ use axum::{
 };
 use clap::Parser;
 use offload_protocol::{
-    DEFAULT_DISCOVERY_PORT, ErrorResponse, JobRecord, ModelEntry, NodeInfo, RunTaskRequest,
-    RunTaskResponse,
+    DEFAULT_DISCOVERY_PORT, ErrorResponse, JobRecord, JobStreamEvent, ModelEntry, NodeInfo,
+    RunTaskRequest, RunTaskResponse,
 };
-use tokio_stream::{StreamExt, wrappers::BroadcastStream};
+use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -339,11 +339,25 @@ async fn stream_job(
         .await
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("job {id} not found")))?;
 
-    let stream = BroadcastStream::new(rx).filter_map(|item| match item {
-        Ok(ev) => serde_json::to_string(&ev)
-            .ok()
-            .map(|json| Ok(Event::default().data(json))),
-        Err(_) => None,
+    // Close right after `Done`, not when the channel closes: pipe-reader tasks of a
+    // cancelled/timed-out job can still hold senders (forever, if a grandchild keeps
+    // the pipe open). `take_while` can't do this; it needs one more item to stop.
+    let stream = futures_util::stream::unfold(Some(rx), |rx| async move {
+        let mut rx = rx?;
+        loop {
+            match rx.recv().await {
+                Ok(ev) => {
+                    let done = matches!(ev, JobStreamEvent::Done { .. });
+                    let Ok(json) = serde_json::to_string(&ev) else {
+                        continue;
+                    };
+                    let next = (!done).then_some(rx);
+                    return Some((Ok::<_, Infallible>(Event::default().data(json)), next));
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
     });
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
@@ -639,5 +653,34 @@ mod tests {
         let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
         let updated: JobRecord = serde_json::from_slice(&body).unwrap();
         assert_eq!(updated.status, JobStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn stream_ends_after_done_even_if_sender_outlives_job() {
+        let state = test_state(None);
+        // `_leaked_tx` plays a pipe-reader task that still holds a sender after cancel.
+        let (record, _leaked_tx) = state.create_job().await;
+        let app = build_router(state.clone(), 16);
+
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/v1/jobs/{}/stream", record.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        state.cancel_job(record.id).await.unwrap();
+
+        let body = tokio::time::timeout(
+            Duration::from_secs(2),
+            axum::body::to_bytes(res.into_body(), 64 * 1024),
+        )
+        .await
+        .expect("SSE stream must close after Done")
+        .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("cancelled"));
     }
 }

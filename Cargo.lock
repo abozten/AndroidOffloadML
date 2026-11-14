@@ -710,7 +710,6 @@ dependencies = [
 name = "offload-client"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "clap",
  "offload-protocol",
  "reqwest",
@@ -738,6 +737,7 @@ dependencies = [
 name = "offload-protocol"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "serde",
  "serde_json",
  "uuid",
@@ -750,6 +750,7 @@ dependencies = [
  "axum",
  "blake3",
  "clap",
+ "futures-util",
  "offload-protocol",
  "serde",
  "serde_json",

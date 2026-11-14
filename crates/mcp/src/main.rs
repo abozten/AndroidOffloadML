@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    sync::{OnceCell, mpsc},
+    sync::{Mutex, mpsc},
 };
 use uuid::Uuid;
 
@@ -54,14 +54,14 @@ struct JsonRpcError {
 
 struct McpState {
     cli: Cli,
-    default_client: OnceCell<OffloadClient>,
+    default_client: Mutex<Option<OffloadClient>>,
 }
 
 impl McpState {
     fn new(cli: Cli) -> Self {
         Self {
             cli,
-            default_client: OnceCell::new(),
+            default_client: Mutex::new(None),
         }
     }
 }
@@ -160,7 +160,13 @@ async fn handle_request(state: &McpState, id: Value, method: &str, params: Value
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let uses_default = args.get("url").and_then(Value::as_str).is_none();
             let outcome = call_tool(state, name, args).await;
+            if outcome.is_err() && uses_default && state.cli.url.is_none() {
+                // ponytail: any error drops the discovered node, so the next call rediscovers
+                // (the phone may have a new DHCP address). Costs one extra discovery after bad-arg errors.
+                *state.default_client.lock().await = None;
+            }
             let result = match outcome {
                 Ok(val) => json!({
                     "content": [{ "type": "text", "text": serde_json::to_string_pretty(&val).unwrap_or_default() }],
@@ -325,23 +331,21 @@ async fn resolve_client(state: &McpState, explicit_url: Option<&str>) -> Result<
     if let Some(url) = explicit_url {
         return OffloadClient::new(url, state.cli.token.clone()).map_err(|e| e.to_string());
     }
-    let client = state
-        .default_client
-        .get_or_try_init(|| async {
-            let url = match state.cli.url.as_deref() {
-                Some(u) => u.to_string(),
-                None => OffloadClient::discover_first(
-                    state.cli.discovery_port,
-                    Duration::from_millis(1500),
-                )
-                .await
-                .map_err(|e| e.to_string())?
-                .url,
-            };
-            OffloadClient::new(url, state.cli.token.clone()).map_err(|e| e.to_string())
-        })
-        .await?;
-    Ok(client.clone())
+    // Lock held across discovery so concurrent calls share one discovery round.
+    let mut cached = state.default_client.lock().await;
+    if let Some(client) = cached.as_ref() {
+        return Ok(client.clone());
+    }
+    let url = match state.cli.url.as_deref() {
+        Some(u) => u.to_string(),
+        None => OffloadClient::discover_first(state.cli.discovery_port, Duration::from_millis(1500))
+            .await
+            .map_err(|e| e.to_string())?
+            .url,
+    };
+    let client = OffloadClient::new(url, state.cli.token.clone()).map_err(|e| e.to_string())?;
+    *cached = Some(client.clone());
+    Ok(client)
 }
 
 async fn execute_task(client: &OffloadClient, task: TaskKind, use_async: bool) -> Result<Value, String> {

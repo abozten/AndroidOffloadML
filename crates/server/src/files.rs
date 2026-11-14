@@ -1,5 +1,5 @@
 use std::{
-    io::{Read, SeekFrom},
+    io::{Seek, SeekFrom},
     path::{Component, Path, PathBuf},
 };
 
@@ -86,19 +86,14 @@ fn part_path(final_path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-async fn compute_blake3(path: PathBuf) -> Result<String, ApiError> {
-    tokio::task::spawn_blocking(move || -> std::io::Result<String> {
-        let mut f = std::fs::File::open(&path)?;
-        let mut hasher = blake3::Hasher::new();
-        let mut buf = vec![0_u8; 256 * 1024];
-        loop {
-            let n = f.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-        Ok(hasher.finalize().to_hex().to_string())
+/// Hash through an already-open handle. Pair it with `file.metadata()` from the same
+/// handle so the digest and the cache stamp describe one inode, even if the path is
+/// renamed over concurrently.
+async fn hash_handle(file: File) -> Result<String, ApiError> {
+    let mut file = file.into_std().await;
+    tokio::task::spawn_blocking(move || {
+        file.rewind()?;
+        offload_protocol::blake3_hex(&file)
     })
     .await
     .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -112,24 +107,30 @@ pub async fn file_status(
     let final_path = resolve_upload_path(&q.path, &state.config.files_dir)?;
     let staging_path = part_path(&final_path);
 
-    let final_meta = fs::metadata(&final_path).await.ok();
     let part_meta = fs::metadata(&staging_path).await.ok();
-    let blake3 = if let Some(ref meta) = final_meta {
-        if let Some(cached) = state.get_file_hash(&final_path, meta).await {
-            Some(cached)
-        } else {
-            let hash = compute_blake3(final_path.clone()).await?;
-            state.insert_file_hash(final_path, meta, hash.clone()).await;
-            Some(hash)
+    let (final_size, blake3) = match File::open(&final_path).await {
+        Ok(file) => {
+            let meta = file
+                .metadata()
+                .await
+                .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let hash = match state.get_file_hash(&final_path, &meta).await {
+                Some(cached) => cached,
+                None => {
+                    let hash = hash_handle(file).await?;
+                    state.insert_file_hash(final_path, &meta, hash.clone()).await;
+                    hash
+                }
+            };
+            (Some(meta.len()), Some(hash))
         }
-    } else {
-        None
+        Err(_) => (None, None),
     };
 
     Ok(Json(FileTransferStatus {
         path: q.path,
-        exists: final_meta.is_some(),
-        final_size: final_meta.map(|m| m.len()),
+        exists: final_size.is_some(),
+        final_size,
         blake3,
         partial_size: part_meta.map(|m| m.len()).unwrap_or(0),
     }))
@@ -195,17 +196,20 @@ pub async fn upload_chunk(
     file.flush()
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    drop(file);
 
     let completed = new_end == q.total_size;
     let blake3 = if completed {
         fs::rename(&staging_path, &final_path)
             .await
             .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let hash = compute_blake3(final_path.clone()).await?;
-        if let Ok(meta) = fs::metadata(&final_path).await {
-            state.insert_file_hash(final_path, &meta, hash.clone()).await;
-        }
+        // Stat and hash our own handle (post-rename, so ctime is final), never the path:
+        // another upload may already have renamed its file over `final_path`.
+        let meta = file
+            .metadata()
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let hash = hash_handle(file).await?;
+        state.insert_file_hash(final_path, &meta, hash.clone()).await;
         Some(hash)
     } else {
         None

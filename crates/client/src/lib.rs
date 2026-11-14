@@ -2,7 +2,11 @@ use std::{
     collections::HashSet,
     io::{Read, SeekFrom},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -183,33 +187,22 @@ impl OffloadClient {
         let mut file = File::open(local_path).await?;
         let total_bytes = file.metadata().await?.len();
         let started = Instant::now();
-        let hash_path = local_path.to_path_buf();
-        let mut hash_handle = Some(tokio::task::spawn_blocking(move || {
-            compute_blake3_sync(&hash_path)
-        }));
-        let mut local_hash: Option<String> = None;
+        let mut local_hash = BackgroundHash::spawn(local_path.to_path_buf());
 
         let status = self.file_status(remote_path).await?;
         if status.exists
             && status.final_size == Some(total_bytes)
             && let Some(remote_hash) = status.blake3.as_deref()
+            && remote_hash == local_hash.get().await?
         {
-            let computed = hash_handle
-                .take()
-                .expect("hash handle present")
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string()))??;
-            if remote_hash == computed {
-                return Ok(TransferSummary {
-                    remote_path: remote_path.to_string(),
-                    total_bytes,
-                    resumed_bytes: total_bytes,
-                    uploaded_bytes: 0,
-                    elapsed: started.elapsed(),
-                    already_existed: true,
-                });
-            }
-            local_hash = Some(computed);
+            return Ok(TransferSummary {
+                remote_path: remote_path.to_string(),
+                total_bytes,
+                resumed_bytes: total_bytes,
+                uploaded_bytes: 0,
+                elapsed: started.elapsed(),
+                already_existed: true,
+            });
         }
 
         let mut offset = if status.partial_size <= total_bytes {
@@ -256,14 +249,7 @@ impl OffloadClient {
 
             if done {
                 if let Some(remote_hash) = resp.blake3 {
-                    let expected = match local_hash.take() {
-                        Some(h) => h,
-                        None => hash_handle
-                            .take()
-                            .expect("hash handle present")
-                            .await
-                            .map_err(|e| std::io::Error::other(e.to_string()))??,
-                    };
+                    let expected = local_hash.get().await?;
                     if remote_hash != expected {
                         return Err(ClientError::ChecksumMismatch {
                             expected,
@@ -381,6 +367,15 @@ impl OffloadClient {
 
         out_file.flush().await?;
         drop(out_file);
+
+        // A clean early EOF must not be promoted to the final file (matters when the
+        // server sent no blake3). The .part stays so the next call resumes from here.
+        if offset != total_bytes {
+            return Err(ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("download ended at {offset} of {total_bytes} bytes"),
+            )));
+        }
 
         if let Some(expected) = status.blake3 {
             let actual = compute_blake3_blocking(&part_path).await?;
@@ -588,25 +583,65 @@ impl ProgressTracker {
     }
 }
 
-fn compute_blake3_sync(path: &Path) -> Result<String, std::io::Error> {
-    let mut f = std::fs::File::open(path)?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0_u8; 256 * 1024];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
+/// Local-file hash started early so it overlaps network round-trips. Dropping it
+/// (early return, error, or hash not needed) stops the read instead of finishing the file.
+struct BackgroundHash {
+    handle: Option<tokio::task::JoinHandle<std::io::Result<String>>>,
+    result: Option<String>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl BackgroundHash {
+    fn spawn(path: PathBuf) -> Self {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            offload_protocol::blake3_hex(StopOnFlag(std::fs::File::open(path)?, flag))
+        });
+        Self {
+            handle: Some(handle),
+            result: None,
+            cancel,
         }
-        hasher.update(&buf[..n]);
     }
-    Ok(hasher.finalize().to_hex().to_string())
+
+    async fn get(&mut self) -> Result<String, ClientError> {
+        if let Some(hash) = &self.result {
+            return Ok(hash.clone());
+        }
+        let handle = self
+            .handle
+            .take()
+            .ok_or_else(|| std::io::Error::other("local hash already failed"))?;
+        let hash = handle.await.map_err(std::io::Error::other)??;
+        self.result = Some(hash.clone());
+        Ok(hash)
+    }
+}
+
+impl Drop for BackgroundHash {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Reader that fails once the flag is set; how a blocking hash gets cancelled.
+struct StopOnFlag<R>(R, Arc<AtomicBool>);
+
+impl<R: Read> Read for StopOnFlag<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.1.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("hash cancelled"));
+        }
+        self.0.read(buf)
+    }
 }
 
 async fn compute_blake3_blocking(path: &Path) -> Result<String, std::io::Error> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || compute_blake3_sync(&path))
+    tokio::task::spawn_blocking(move || offload_protocol::blake3_hex(std::fs::File::open(path)?))
         .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?
+        .map_err(std::io::Error::other)?
 }
 
 async fn send_json<T: serde::de::DeserializeOwned>(req: RequestBuilder) -> Result<T, ClientError> {

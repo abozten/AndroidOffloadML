@@ -27,13 +27,41 @@ pub struct ServerConfig {
     pub default_timeout_secs: u64,
 }
 
-type FileHashCache = HashMap<PathBuf, (u64, SystemTime, String)>;
+/// Identity of a file version. ctime + inode catch replacements that preserve
+/// size and mtime (`cp -p`, `adb push`), which mtime alone misses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    ctime_ns: (i64, i64),
+}
+
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            len: meta.len(),
+            modified: meta.modified().ok()?,
+            #[cfg(unix)]
+            ino: meta.ino(),
+            #[cfg(unix)]
+            ctime_ns: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+}
+
+type FileHashCache = HashMap<PathBuf, (FileStamp, String)>;
 
 /// Shared application state across HTTP handlers and background job workers.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<ServerConfig>,
     pub semaphore: Arc<Semaphore>,
+    max_jobs: usize,
     jobs: Arc<RwLock<JobStore>>,
     file_hashes: Arc<RwLock<FileHashCache>>,
 }
@@ -56,41 +84,35 @@ impl AppState {
         Self {
             config: Arc::new(config),
             semaphore: Arc::new(Semaphore::new(max_jobs)),
+            max_jobs,
             jobs: Arc::new(RwLock::new(JobStore::default())),
             file_hashes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     pub fn active_job_count(&self) -> usize {
-        self.config
-            .max_concurrent_jobs
-            .max(1)
+        self.max_jobs
             .saturating_sub(self.semaphore.available_permits())
     }
 
     pub async fn get_file_hash(&self, path: &Path, meta: &std::fs::Metadata) -> Option<String> {
-        let modified = meta.modified().ok()?;
-        let len = meta.len();
+        let stamp = FileStamp::of(meta)?;
         let cache = self.file_hashes.read().await;
-        cache.get(path).and_then(|(cached_len, cached_mtime, hash)| {
-            if *cached_len == len && *cached_mtime == modified {
-                Some(hash.clone())
-            } else {
-                None
-            }
-        })
+        cache
+            .get(path)
+            .filter(|(cached, _)| *cached == stamp)
+            .map(|(_, hash)| hash.clone())
     }
 
     pub async fn insert_file_hash(&self, path: PathBuf, meta: &std::fs::Metadata, hash: String) {
-        let Ok(modified) = meta.modified() else {
+        let Some(stamp) = FileStamp::of(meta) else {
             return;
         };
-        let len = meta.len();
         let mut cache = self.file_hashes.write().await;
         if cache.len() >= 1024 && !cache.contains_key(&path) {
             cache.clear();
         }
-        cache.insert(path, (len, modified, hash));
+        cache.insert(path, (stamp, hash));
     }
 
     pub async fn create_job(&self) -> (JobRecord, broadcast::Sender<JobStreamEvent>) {

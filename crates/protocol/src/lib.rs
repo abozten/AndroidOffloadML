@@ -1,6 +1,19 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Streaming BLAKE3 hex digest. Client and server must agree byte-for-byte, so both use this.
+pub fn blake3_hex(mut reader: impl std::io::Read) -> std::io::Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0_u8; 256 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(hasher.finalize().to_hex().to_string());
+        }
+        hasher.update(&buf[..n]);
+    }
+}
+
 /// Default UDP port used for zero-config LAN discovery.
 pub const DEFAULT_DISCOVERY_PORT: u16 = 7879;
 
