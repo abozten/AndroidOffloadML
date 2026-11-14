@@ -151,7 +151,11 @@ cargo run -p offload-client -- llama \
 **Allowlisted scripts:**
 
 ```bash
-cargo run -p offload-client -- cmd --program python3 -- ~/scripts/run_onnx.py --input data.json
+# Script already on the phone (use the absolute Termux path; your local shell would expand `~`)
+cargo run -p offload-client -- cmd --program python3 -- /data/data/com.termux/files/home/scripts/run_onnx.py --input data.json
+
+# Local script, sent as stdin; `python3 -` reads code from stdin
+cargo run -p offload-client -- cmd --program python3 --stdin-file ./run_onnx.py -- - --input data.json
 ```
 
 ## Use with AI agents (MCP)

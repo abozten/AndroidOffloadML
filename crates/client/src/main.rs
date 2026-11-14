@@ -94,6 +94,9 @@ enum Commands {
         r#async: bool,
         #[arg(long)]
         stream: bool,
+        /// Send this local file as the program's stdin (e.g. `--program python3 --stdin-file x.py -- -`)
+        #[arg(long)]
+        stdin_file: Option<PathBuf>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -219,12 +222,14 @@ async fn run() -> CliResult {
             program,
             r#async,
             stream,
+            stdin_file,
             args,
         } => {
+            let stdin = stdin_file.map(std::fs::read_to_string).transpose()?;
             let task = TaskKind::Command {
                 program,
                 args,
-                stdin: None,
+                stdin,
                 timeout_secs: None,
             };
             execute_cli_task(&client, task, r#async, stream).await?;
