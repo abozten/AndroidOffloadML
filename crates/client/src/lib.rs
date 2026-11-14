@@ -183,21 +183,33 @@ impl OffloadClient {
         let mut file = File::open(local_path).await?;
         let total_bytes = file.metadata().await?.len();
         let started = Instant::now();
-        let local_hash = compute_blake3_blocking(local_path).await?;
+        let hash_path = local_path.to_path_buf();
+        let mut hash_handle = Some(tokio::task::spawn_blocking(move || {
+            compute_blake3_sync(&hash_path)
+        }));
+        let mut local_hash: Option<String> = None;
 
         let status = self.file_status(remote_path).await?;
         if status.exists
             && status.final_size == Some(total_bytes)
-            && status.blake3.as_deref() == Some(local_hash.as_str())
+            && let Some(remote_hash) = status.blake3.as_deref()
         {
-            return Ok(TransferSummary {
-                remote_path: remote_path.to_string(),
-                total_bytes,
-                resumed_bytes: total_bytes,
-                uploaded_bytes: 0,
-                elapsed: started.elapsed(),
-                already_existed: true,
-            });
+            let computed = hash_handle
+                .take()
+                .expect("hash handle present")
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))??;
+            if remote_hash == computed {
+                return Ok(TransferSummary {
+                    remote_path: remote_path.to_string(),
+                    total_bytes,
+                    resumed_bytes: total_bytes,
+                    uploaded_bytes: 0,
+                    elapsed: started.elapsed(),
+                    already_existed: true,
+                });
+            }
+            local_hash = Some(computed);
         }
 
         let mut offset = if status.partial_size <= total_bytes {
@@ -210,18 +222,11 @@ impl OffloadClient {
 
         let chunk_cap = chunk_size.max(64 * 1024);
         let mut buf = vec![0_u8; chunk_cap];
-        let mut ema_speed_bps = 0.0_f64;
+        let mut tracker = ProgressTracker::new(total_bytes, resumed_bytes);
 
-        on_progress(TransferProgress {
-            bytes_done: offset,
-            total_bytes,
-            resumed_bytes,
-            speed_bps: 0.0,
-            eta_secs: None,
-        });
+        on_progress(tracker.initial());
 
         loop {
-            let chunk_start = Instant::now();
             let n = read_full_chunk(&mut file, &mut buf).await?;
             if n == 0 && offset < total_bytes {
                 return Err(ClientError::Io(std::io::Error::new(
@@ -244,37 +249,27 @@ impl OffloadClient {
             let resp: ChunkUploadResponse = send_json(req).await?;
             offset = resp.partial_size;
 
-            let dt = chunk_start.elapsed().as_secs_f64().max(1e-4);
-            let inst_bps = (n as f64) / dt;
-            ema_speed_bps = if ema_speed_bps == 0.0 {
-                inst_bps
-            } else {
-                0.3 * inst_bps + 0.7 * ema_speed_bps
-            };
+            let done = resp.completed || offset >= total_bytes;
+            if let Some(progress) = tracker.update(n as u64, offset, done) {
+                on_progress(progress);
+            }
 
-            let remaining = total_bytes.saturating_sub(offset);
-            let eta_secs = if ema_speed_bps > 1.0 && remaining > 0 {
-                Some((remaining as f64 / ema_speed_bps).ceil() as u64)
-            } else {
-                Some(0)
-            };
-
-            on_progress(TransferProgress {
-                bytes_done: offset,
-                total_bytes,
-                resumed_bytes,
-                speed_bps: ema_speed_bps,
-                eta_secs,
-            });
-
-            if resp.completed || offset >= total_bytes {
-                if let Some(remote_hash) = resp.blake3
-                    && remote_hash != local_hash
-                {
-                    return Err(ClientError::ChecksumMismatch {
-                        expected: local_hash,
-                        actual: remote_hash,
-                    });
+            if done {
+                if let Some(remote_hash) = resp.blake3 {
+                    let expected = match local_hash.take() {
+                        Some(h) => h,
+                        None => hash_handle
+                            .take()
+                            .expect("hash handle present")
+                            .await
+                            .map_err(|e| std::io::Error::other(e.to_string()))??,
+                    };
+                    if remote_hash != expected {
+                        return Err(ClientError::ChecksumMismatch {
+                            expected,
+                            actual: remote_hash,
+                        });
+                    }
                 }
                 break;
             }
@@ -371,42 +366,17 @@ impl OffloadClient {
             out_file.seek(SeekFrom::Start(0)).await?;
         }
 
-        let mut ema_speed_bps = 0.0_f64;
-        let mut last_tick = Instant::now();
-        on_progress(TransferProgress {
-            bytes_done: offset,
-            total_bytes,
-            resumed_bytes,
-            speed_bps: 0.0,
-            eta_secs: None,
-        });
+        let mut tracker = ProgressTracker::new(total_bytes, resumed_bytes);
+        on_progress(tracker.initial());
 
         while let Some(chunk) = res.chunk().await? {
             out_file.write_all(&chunk).await?;
             offset += chunk.len() as u64;
 
-            let dt = last_tick.elapsed().as_secs_f64().max(1e-4);
-            let inst_bps = (chunk.len() as f64) / dt;
-            ema_speed_bps = if ema_speed_bps == 0.0 {
-                inst_bps
-            } else {
-                0.3 * inst_bps + 0.7 * ema_speed_bps
-            };
-            last_tick = Instant::now();
-
-            let remaining = total_bytes.saturating_sub(offset);
-            let eta_secs = if ema_speed_bps > 1.0 && remaining > 0 {
-                Some((remaining as f64 / ema_speed_bps).ceil() as u64)
-            } else {
-                Some(0)
-            };
-            on_progress(TransferProgress {
-                bytes_done: offset,
-                total_bytes,
-                resumed_bytes,
-                speed_bps: ema_speed_bps,
-                eta_secs,
-            });
+            if let Some(progress) = tracker.update(chunk.len() as u64, offset, offset >= total_bytes)
+            {
+                on_progress(progress);
+            }
         }
 
         out_file.flush().await?;
@@ -554,23 +524,89 @@ async fn read_full_chunk(file: &mut File, buf: &mut [u8]) -> Result<usize, std::
     Ok(filled)
 }
 
+const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_millis(100);
+
+struct ProgressTracker {
+    total_bytes: u64,
+    resumed_bytes: u64,
+    ema_speed_bps: f64,
+    last_report: Instant,
+    pending_bytes: u64,
+}
+
+impl ProgressTracker {
+    fn new(total_bytes: u64, resumed_bytes: u64) -> Self {
+        Self {
+            total_bytes,
+            resumed_bytes,
+            ema_speed_bps: 0.0,
+            last_report: Instant::now(),
+            pending_bytes: 0,
+        }
+    }
+
+    fn initial(&self) -> TransferProgress {
+        TransferProgress {
+            bytes_done: self.resumed_bytes,
+            total_bytes: self.total_bytes,
+            resumed_bytes: self.resumed_bytes,
+            speed_bps: 0.0,
+            eta_secs: None,
+        }
+    }
+
+    fn update(&mut self, bytes_delta: u64, bytes_done: u64, force: bool) -> Option<TransferProgress> {
+        self.pending_bytes += bytes_delta;
+        let elapsed = self.last_report.elapsed();
+        if !force && elapsed < PROGRESS_REPORT_INTERVAL {
+            return None;
+        }
+        let dt = elapsed.as_secs_f64().max(1e-4);
+        let inst_bps = (self.pending_bytes as f64) / dt;
+        self.ema_speed_bps = if self.ema_speed_bps == 0.0 {
+            inst_bps
+        } else {
+            0.3 * inst_bps + 0.7 * self.ema_speed_bps
+        };
+        self.pending_bytes = 0;
+        self.last_report = Instant::now();
+
+        let remaining = self.total_bytes.saturating_sub(bytes_done);
+        let eta_secs = if self.ema_speed_bps > 1.0 && remaining > 0 {
+            Some((remaining as f64 / self.ema_speed_bps).ceil() as u64)
+        } else {
+            Some(0)
+        };
+
+        Some(TransferProgress {
+            bytes_done,
+            total_bytes: self.total_bytes,
+            resumed_bytes: self.resumed_bytes,
+            speed_bps: self.ema_speed_bps,
+            eta_secs,
+        })
+    }
+}
+
+fn compute_blake3_sync(path: &Path) -> Result<String, std::io::Error> {
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0_u8; 256 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 async fn compute_blake3_blocking(path: &Path) -> Result<String, std::io::Error> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> std::io::Result<String> {
-        let mut f = std::fs::File::open(path)?;
-        let mut hasher = blake3::Hasher::new();
-        let mut buf = vec![0_u8; 256 * 1024];
-        loop {
-            let n = f.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-        Ok(hasher.finalize().to_hex().to_string())
-    })
-    .await
-    .map_err(|e| std::io::Error::other(e.to_string()))?
+    tokio::task::spawn_blocking(move || compute_blake3_sync(&path))
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
 }
 
 async fn send_json<T: serde::de::DeserializeOwned>(req: RequestBuilder) -> Result<T, ClientError> {
@@ -595,4 +631,26 @@ async fn extract_api_error(res: reqwest::Response) -> ClientError {
             }
         });
     ClientError::Api { status, message }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_tracker_throttles_and_forces_final_update() {
+        let mut tracker = ProgressTracker::new(1000, 0);
+        let init = tracker.initial();
+        assert_eq!(init.bytes_done, 0);
+        assert_eq!(init.total_bytes, 1000);
+        assert!(init.eta_secs.is_none());
+
+        // Immediate non-forced update within 100 ms should be throttled.
+        assert!(tracker.update(100, 100, false).is_none());
+        // Forced final update should emit immediately with accumulated bytes.
+        let final_p = tracker.update(900, 1000, true).expect("forced update");
+        assert_eq!(final_p.bytes_done, 1000);
+        assert_eq!(final_p.eta_secs, Some(0));
+        assert!(final_p.speed_bps > 0.0);
+    }
 }

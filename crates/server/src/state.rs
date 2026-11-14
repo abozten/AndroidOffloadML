@@ -1,10 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -30,18 +27,20 @@ pub struct ServerConfig {
     pub default_timeout_secs: u64,
 }
 
+type FileHashCache = HashMap<PathBuf, (u64, SystemTime, String)>;
+
 /// Shared application state across HTTP handlers and background job workers.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<ServerConfig>,
     pub semaphore: Arc<Semaphore>,
-    pub active_jobs: Arc<AtomicUsize>,
     jobs: Arc<RwLock<JobStore>>,
+    file_hashes: Arc<RwLock<FileHashCache>>,
 }
 
 struct JobEntry {
     record: JobRecord,
-    tx: broadcast::Sender<JobStreamEvent>,
+    tx: Option<broadcast::Sender<JobStreamEvent>>,
     abort_handle: Option<AbortHandle>,
 }
 
@@ -57,13 +56,41 @@ impl AppState {
         Self {
             config: Arc::new(config),
             semaphore: Arc::new(Semaphore::new(max_jobs)),
-            active_jobs: Arc::new(AtomicUsize::new(0)),
             jobs: Arc::new(RwLock::new(JobStore::default())),
+            file_hashes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     pub fn active_job_count(&self) -> usize {
-        self.active_jobs.load(Ordering::Relaxed)
+        self.config
+            .max_concurrent_jobs
+            .max(1)
+            .saturating_sub(self.semaphore.available_permits())
+    }
+
+    pub async fn get_file_hash(&self, path: &Path, meta: &std::fs::Metadata) -> Option<String> {
+        let modified = meta.modified().ok()?;
+        let len = meta.len();
+        let cache = self.file_hashes.read().await;
+        cache.get(path).and_then(|(cached_len, cached_mtime, hash)| {
+            if *cached_len == len && *cached_mtime == modified {
+                Some(hash.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub async fn insert_file_hash(&self, path: PathBuf, meta: &std::fs::Metadata, hash: String) {
+        let Ok(modified) = meta.modified() else {
+            return;
+        };
+        let len = meta.len();
+        let mut cache = self.file_hashes.write().await;
+        if cache.len() >= 1024 && !cache.contains_key(&path) {
+            cache.clear();
+        }
+        cache.insert(path, (len, modified, hash));
     }
 
     pub async fn create_job(&self) -> (JobRecord, broadcast::Sender<JobStreamEvent>) {
@@ -83,7 +110,7 @@ impl AppState {
             id,
             JobEntry {
                 record: record.clone(),
-                tx: tx.clone(),
+                tx: Some(tx.clone()),
                 abort_handle: None,
             },
         );
@@ -127,11 +154,13 @@ impl AppState {
             entry.record.result = Some(result);
             entry.record.error = None;
             entry.abort_handle = None;
-            let _ = entry.tx.send(JobStreamEvent::Done {
-                status: JobStatus::Succeeded,
-                duration_ms: Some(duration_ms),
-                error: None,
-            });
+            if let Some(tx) = entry.tx.take() {
+                let _ = tx.send(JobStreamEvent::Done {
+                    status: JobStatus::Succeeded,
+                    duration_ms: Some(duration_ms),
+                    error: None,
+                });
+            }
         }
     }
 
@@ -146,11 +175,13 @@ impl AppState {
             entry.record.result = None;
             entry.record.error = Some(error.clone());
             entry.abort_handle = None;
-            let _ = entry.tx.send(JobStreamEvent::Done {
-                status: JobStatus::Failed,
-                duration_ms: Some(duration_ms),
-                error: Some(error),
-            });
+            if let Some(tx) = entry.tx.take() {
+                let _ = tx.send(JobStreamEvent::Done {
+                    status: JobStatus::Failed,
+                    duration_ms: Some(duration_ms),
+                    error: Some(error),
+                });
+            }
         }
     }
 
@@ -165,11 +196,13 @@ impl AppState {
                 }
                 entry.record.status = JobStatus::Cancelled;
                 entry.record.error = Some("cancelled by client".to_string());
-                let _ = entry.tx.send(JobStreamEvent::Done {
-                    status: JobStatus::Cancelled,
-                    duration_ms: None,
-                    error: entry.record.error.clone(),
-                });
+                if let Some(tx) = entry.tx.take() {
+                    let _ = tx.send(JobStreamEvent::Done {
+                        status: JobStatus::Cancelled,
+                        duration_ms: None,
+                        error: entry.record.error.clone(),
+                    });
+                }
             }
             JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled => {}
         }
@@ -186,10 +219,19 @@ impl AppState {
         id: Uuid,
     ) -> Option<(JobRecord, broadcast::Receiver<JobStreamEvent>)> {
         let store = self.jobs.read().await;
-        store
-            .entries
-            .get(&id)
-            .map(|e| (e.record.clone(), e.tx.subscribe()))
+        let entry = store.entries.get(&id)?;
+        let rx = if let Some(tx) = &entry.tx {
+            tx.subscribe()
+        } else {
+            let (tx, rx) = broadcast::channel(1);
+            let _ = tx.send(JobStreamEvent::Done {
+                status: entry.record.status,
+                duration_ms: entry.record.duration_ms,
+                error: entry.record.error.clone(),
+            });
+            rx
+        };
+        Some((entry.record.clone(), rx))
     }
 
     pub async fn list_jobs(&self) -> Vec<JobRecord> {
@@ -245,5 +287,40 @@ mod tests {
         let after = state.get_job(rec.id).await.unwrap();
         assert_eq!(after.status, JobStatus::Cancelled);
         assert!(after.result.is_none());
+    }
+
+    #[tokio::test]
+    async fn file_hash_cache_hits_and_invalidates_on_change() {
+        let dir = std::env::temp_dir().join(format!("offload-cache-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.bin");
+        std::fs::write(&path, b"hello").unwrap();
+
+        let state = AppState::new(ServerConfig {
+            auth_token: None,
+            max_concurrent_jobs: 1,
+            models_dir: None,
+            files_dir: dir.clone(),
+            llama_bin: "llama-cli".into(),
+            allowed_commands: vec![],
+            default_timeout_secs: 60,
+        });
+
+        let meta1 = std::fs::metadata(&path).unwrap();
+        assert!(state.get_file_hash(&path, &meta1).await.is_none());
+
+        state
+            .insert_file_hash(path.clone(), &meta1, "hash1".to_string())
+            .await;
+        assert_eq!(
+            state.get_file_hash(&path, &meta1).await.as_deref(),
+            Some("hash1")
+        );
+
+        std::fs::write(&path, b"hello world").unwrap();
+        let meta2 = std::fs::metadata(&path).unwrap();
+        assert!(state.get_file_hash(&path, &meta2).await.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

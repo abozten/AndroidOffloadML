@@ -114,8 +114,14 @@ pub async fn file_status(
 
     let final_meta = fs::metadata(&final_path).await.ok();
     let part_meta = fs::metadata(&staging_path).await.ok();
-    let blake3 = if final_meta.is_some() {
-        Some(compute_blake3(final_path).await?)
+    let blake3 = if let Some(ref meta) = final_meta {
+        if let Some(cached) = state.get_file_hash(&final_path, meta).await {
+            Some(cached)
+        } else {
+            let hash = compute_blake3(final_path.clone()).await?;
+            state.insert_file_hash(final_path, meta, hash.clone()).await;
+            Some(hash)
+        }
     } else {
         None
     };
@@ -196,7 +202,11 @@ pub async fn upload_chunk(
         fs::rename(&staging_path, &final_path)
             .await
             .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        Some(compute_blake3(final_path).await?)
+        let hash = compute_blake3(final_path.clone()).await?;
+        if let Ok(meta) = fs::metadata(&final_path).await {
+            state.insert_file_hash(final_path, &meta, hash.clone()).await;
+        }
+        Some(hash)
     } else {
         None
     };

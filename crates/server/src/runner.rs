@@ -270,12 +270,20 @@ fn run_cosine_top_k(
         scored.push(SimilarityMatch { index, score });
     }
 
-    scored.sort_by(|lhs, rhs| {
+    let cmp = |lhs: &SimilarityMatch, rhs: &SimilarityMatch| {
         rhs.score
             .total_cmp(&lhs.score)
             .then_with(|| lhs.index.cmp(&rhs.index))
-    });
-    scored.truncate(top_k);
+    };
+    if top_k == 0 {
+        scored.clear();
+    } else {
+        if top_k < scored.len() {
+            scored.select_nth_unstable_by(top_k - 1, cmp);
+            scored.truncate(top_k);
+        }
+        scored.sort_by(cmp);
+    }
 
     Ok(TaskResult::CosineTopK { matches: scored })
 }

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    sync::mpsc,
+    sync::{OnceCell, mpsc},
 };
 use uuid::Uuid;
 
@@ -52,9 +52,23 @@ struct JsonRpcError {
     message: String,
 }
 
+struct McpState {
+    cli: Cli,
+    default_client: OnceCell<OffloadClient>,
+}
+
+impl McpState {
+    fn new(cli: Cli) -> Self {
+        Self {
+            cli,
+            default_client: OnceCell::new(),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    let cli = Arc::new(Cli::parse());
+    let state = Arc::new(McpState::new(Cli::parse()));
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
     let (tx, mut rx) = mpsc::channel::<JsonRpcResponse>(128);
@@ -96,10 +110,10 @@ async fn main() {
             continue;
         };
 
-        let cli = Arc::clone(&cli);
+        let state = Arc::clone(&state);
         let tx = tx.clone();
         tokio::spawn(async move {
-            let resp = handle_request(&cli, id, &req.method, req.params).await;
+            let resp = handle_request(&state, id, &req.method, req.params).await;
             let _ = tx.send(resp).await;
         });
     }
@@ -116,7 +130,7 @@ async fn write_response(stdout: &mut tokio::io::Stdout, resp: &JsonRpcResponse) 
     }
 }
 
-async fn handle_request(cli: &Cli, id: Value, method: &str, params: Value) -> JsonRpcResponse {
+async fn handle_request(state: &McpState, id: Value, method: &str, params: Value) -> JsonRpcResponse {
     match method {
         "initialize" => JsonRpcResponse {
             jsonrpc: "2.0",
@@ -146,7 +160,7 @@ async fn handle_request(cli: &Cli, id: Value, method: &str, params: Value) -> Js
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            let outcome = call_tool(cli, name, args).await;
+            let outcome = call_tool(state, name, args).await;
             let result = match outcome {
                 Ok(val) => json!({
                     "content": [{ "type": "text", "text": serde_json::to_string_pretty(&val).unwrap_or_default() }],
@@ -307,15 +321,27 @@ fn tool_definitions() -> Value {
     ])
 }
 
-async fn resolve_client(cli: &Cli, explicit_url: Option<&str>) -> Result<OffloadClient, String> {
-    let url = match explicit_url.or(cli.url.as_deref()) {
-        Some(u) => u.to_string(),
-        None => OffloadClient::discover_first(cli.discovery_port, Duration::from_millis(1500))
-            .await
-            .map_err(|e| e.to_string())?
-            .url,
-    };
-    OffloadClient::new(url, cli.token.clone()).map_err(|e| e.to_string())
+async fn resolve_client(state: &McpState, explicit_url: Option<&str>) -> Result<OffloadClient, String> {
+    if let Some(url) = explicit_url {
+        return OffloadClient::new(url, state.cli.token.clone()).map_err(|e| e.to_string());
+    }
+    let client = state
+        .default_client
+        .get_or_try_init(|| async {
+            let url = match state.cli.url.as_deref() {
+                Some(u) => u.to_string(),
+                None => OffloadClient::discover_first(
+                    state.cli.discovery_port,
+                    Duration::from_millis(1500),
+                )
+                .await
+                .map_err(|e| e.to_string())?
+                .url,
+            };
+            OffloadClient::new(url, state.cli.token.clone()).map_err(|e| e.to_string())
+        })
+        .await?;
+    Ok(client.clone())
 }
 
 async fn execute_task(client: &OffloadClient, task: TaskKind, use_async: bool) -> Result<Value, String> {
@@ -331,24 +357,25 @@ async fn execute_task(client: &OffloadClient, task: TaskKind, use_async: bool) -
     }
 }
 
-async fn call_tool(cli: &Cli, name: &str, args: Value) -> Result<Value, String> {
+async fn call_tool(state: &McpState, name: &str, args: Value) -> Result<Value, String> {
     let explicit_url = args.get("url").and_then(Value::as_str);
 
     match name {
         "discover_nodes" => {
             let ms = args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(1500);
-            let nodes = OffloadClient::discover(cli.discovery_port, Duration::from_millis(ms))
-                .await
-                .map_err(|e| e.to_string())?;
+            let nodes =
+                OffloadClient::discover(state.cli.discovery_port, Duration::from_millis(ms))
+                    .await
+                    .map_err(|e| e.to_string())?;
             serde_json::to_value(nodes).map_err(|e| e.to_string())
         }
         "node_info" => {
-            let client = resolve_client(cli, explicit_url).await?;
+            let client = resolve_client(state, explicit_url).await?;
             let info = client.info().await.map_err(|e| e.to_string())?;
             serde_json::to_value(info).map_err(|e| e.to_string())
         }
         "run_llama" => {
-            let client = resolve_client(cli, explicit_url).await?;
+            let client = resolve_client(state, explicit_url).await?;
             let model = args
                 .get("model")
                 .and_then(Value::as_str)
@@ -383,7 +410,7 @@ async fn call_tool(cli: &Cli, name: &str, args: Value) -> Result<Value, String> 
             .await
         }
         "run_command" => {
-            let client = resolve_client(cli, explicit_url).await?;
+            let client = resolve_client(state, explicit_url).await?;
             let program = args
                 .get("program")
                 .and_then(Value::as_str)
@@ -413,7 +440,7 @@ async fn call_tool(cli: &Cli, name: &str, args: Value) -> Result<Value, String> 
             .await
         }
         "run_task" => {
-            let client = resolve_client(cli, explicit_url).await?;
+            let client = resolve_client(state, explicit_url).await?;
             let task_val = args.get("task").cloned().ok_or("missing required 'task'")?;
             let task: TaskKind =
                 serde_json::from_value(task_val).map_err(|e| format!("invalid 'task': {e}"))?;
@@ -421,7 +448,7 @@ async fn call_tool(cli: &Cli, name: &str, args: Value) -> Result<Value, String> 
             execute_task(&client, task, use_async).await
         }
         "get_job" => {
-            let client = resolve_client(cli, explicit_url).await?;
+            let client = resolve_client(state, explicit_url).await?;
             let id_str = args
                 .get("id")
                 .and_then(Value::as_str)
@@ -431,7 +458,7 @@ async fn call_tool(cli: &Cli, name: &str, args: Value) -> Result<Value, String> 
             serde_json::to_value(job).map_err(|e| e.to_string())
         }
         "push_file" => {
-            let client = resolve_client(cli, explicit_url).await?;
+            let client = resolve_client(state, explicit_url).await?;
             let local_str = args
                 .get("local_path")
                 .and_then(Value::as_str)
@@ -460,7 +487,7 @@ async fn call_tool(cli: &Cli, name: &str, args: Value) -> Result<Value, String> 
             }))
         }
         "pull_file" => {
-            let client = resolve_client(cli, explicit_url).await?;
+            let client = resolve_client(state, explicit_url).await?;
             let remote_path = args
                 .get("remote_path")
                 .and_then(Value::as_str)
@@ -484,12 +511,12 @@ async fn call_tool(cli: &Cli, name: &str, args: Value) -> Result<Value, String> 
             }))
         }
         "list_models" => {
-            let client = resolve_client(cli, explicit_url).await?;
+            let client = resolve_client(state, explicit_url).await?;
             let models = client.list_models().await.map_err(|e| e.to_string())?;
             serde_json::to_value(models).map_err(|e| e.to_string())
         }
         "cancel_job" => {
-            let client = resolve_client(cli, explicit_url).await?;
+            let client = resolve_client(state, explicit_url).await?;
             let id_str = args
                 .get("id")
                 .and_then(Value::as_str)
@@ -516,12 +543,12 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_and_tools_list_return_valid_mcp_payloads() {
-        let cli = test_cli();
-        let init = handle_request(&cli, json!(1), "initialize", json!({})).await;
+        let state = McpState::new(test_cli());
+        let init = handle_request(&state, json!(1), "initialize", json!({})).await;
         assert!(init.error.is_none());
         assert_eq!(init.result.unwrap()["serverInfo"]["name"], "offload-mcp");
 
-        let list = handle_request(&cli, json!(2), "tools/list", json!({})).await;
+        let list = handle_request(&state, json!(2), "tools/list", json!({})).await;
         assert!(list.error.is_none());
         let tools = list.result.unwrap()["tools"].as_array().unwrap().len();
         assert_eq!(tools, 10);

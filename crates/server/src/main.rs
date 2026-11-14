@@ -8,10 +8,6 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
     time::{Duration, Instant},
 };
 
@@ -28,11 +24,10 @@ use axum::{
 };
 use clap::Parser;
 use offload_protocol::{
-    DEFAULT_DISCOVERY_PORT, ErrorResponse, JobRecord, JobStatus, JobStreamEvent, ModelEntry,
-    NodeInfo, RunTaskRequest, RunTaskResponse,
+    DEFAULT_DISCOVERY_PORT, ErrorResponse, JobRecord, ModelEntry, NodeInfo, RunTaskRequest,
+    RunTaskResponse,
 };
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -197,21 +192,6 @@ async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
-struct ActiveJobGuard(Arc<AtomicUsize>);
-
-impl ActiveJobGuard {
-    fn enter(counter: Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
-        Self(counter)
-    }
-}
-
-impl Drop for ActiveJobGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 async fn get_info(State(state): State<AppState>) -> Json<NodeInfo> {
     let logical_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -278,7 +258,6 @@ async fn run_sync(
         .await
         .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "worker shutting down"))?;
 
-    let _guard = ActiveJobGuard::enter(state.active_jobs.clone());
     let started = Instant::now();
     let result = execute_task(req.task, &state.config, None).await;
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -308,7 +287,6 @@ async fn submit_job(
             return;
         };
 
-        let _guard = ActiveJobGuard::enter(worker_state.active_jobs.clone());
         worker_state.mark_running(job_id).await;
         let started = Instant::now();
         let outcome = execute_task(req.task, &worker_state.config, Some(stream_tx)).await;
@@ -356,50 +334,19 @@ async fn stream_job(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    let (record, mut rx) = state
+    let (_record, rx) = state
         .subscribe_job(id)
         .await
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("job {id} not found")))?;
 
-    let (tx, mpsc_rx) = mpsc::channel::<Result<Event, Infallible>>(64);
-    tokio::spawn(async move {
-        // If already terminal, emit Done immediately and close.
-        if matches!(
-            record.status,
-            JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
-        ) {
-            let done = JobStreamEvent::Done {
-                status: record.status,
-                duration_ms: record.duration_ms,
-                error: record.error,
-            };
-            if let Ok(json) = serde_json::to_string(&done) {
-                let _ = tx.send(Ok(Event::default().data(json))).await;
-            }
-            return;
-        }
-
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    let is_done = matches!(ev, JobStreamEvent::Done { .. });
-                    if let Ok(json) = serde_json::to_string(&ev)
-                        && tx.send(Ok(Event::default().data(json))).await.is_err()
-                    {
-                        break;
-                    }
-                    if is_done {
-                        break;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
+    let stream = BroadcastStream::new(rx).filter_map(|item| match item {
+        Ok(ev) => serde_json::to_string(&ev)
+            .ok()
+            .map(|json| Ok(Event::default().data(json))),
+        Err(_) => None,
     });
 
-    Ok(Sse::new(ReceiverStream::new(mpsc_rx))
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
 async fn list_jobs(State(state): State<AppState>) -> Json<Vec<JobRecord>> {
@@ -482,7 +429,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use axum::{body::Body, http::Request as HttpRequest};
-    use offload_protocol::{TaskKind, TaskResult};
+    use offload_protocol::{JobStatus, TaskKind, TaskResult};
     use tower::ServiceExt;
 
     use super::*;
