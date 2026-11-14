@@ -2,22 +2,33 @@
 name = "offload-server"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+description = "HTTP + LAN-discovery server that runs ML/compute tasks on Android (Termux)."
 license.workspace = true
 
 [dependencies]
 axum.workspace = true
 blake3.workspace = true
 clap.workspace = true
-futures-util = "0.3"
-offload-protocol = { path = "../protocol" }
+futures-util.workspace = true
+mimalloc = { workspace = true, optional = true }
+offload-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tokio-stream.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 
+[features]
+# mimalloc global allocator (M-MIMALLOC-APPS). Off by default: it compiles C, so a
+# cross build needs an aarch64 musl C toolchain (e.g. `brew install filosottile/musl-cross/musl-cross`).
+mimalloc = ["dep:mimalloc"]
+
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
+tower.workspace = true
+
+[lints]
+workspace = true

@@ -2,13 +2,18 @@
 name = "offload-mcp"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+description = "MCP stdio server exposing the Android offload server as agent tools."
 license.workspace = true
 
 [dependencies]
 clap.workspace = true
-offload-client = { path = "../client" }
-offload-protocol = { path = "../protocol" }
+offload-client.workspace = true
+offload-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+
+[lints]
+workspace = true

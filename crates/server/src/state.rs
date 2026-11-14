@@ -1,3 +1,5 @@
+//! Shared server state: config, concurrency limit, job registry, and file-hash cache.
+
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
@@ -12,8 +14,20 @@ use tokio::{
 };
 use uuid::Uuid;
 
+/// Finished and running job records kept for `GET /v1/jobs`; oldest are evicted first.
+///
+/// Records can hold full task results (up to 4 MiB of output each), so this bounds memory.
 const MAX_RETAINED_JOBS: usize = 200;
+
+/// Buffered SSE events per job. A subscriber that falls further behind skips lines
+/// (`Lagged`) rather than stalling the subprocess pipe readers.
 const STREAM_CHANNEL_CAPACITY: usize = 256;
+
+/// Max cached file digests before the cache is cleared wholesale.
+///
+/// Each entry is ~200 bytes; 1024 covers any realistic models dir. Clearing (not LRU)
+/// only costs a re-hash on the next status call.
+const MAX_CACHED_FILE_HASHES: usize = 1024;
 
 /// Runtime configuration for the offload server.
 #[derive(Debug, Clone)]
@@ -57,7 +71,7 @@ impl FileStamp {
 type FileHashCache = HashMap<PathBuf, (FileStamp, String)>;
 
 /// Shared application state across HTTP handlers and background job workers.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AppState {
     pub config: Arc<ServerConfig>,
     pub semaphore: Arc<Semaphore>,
@@ -66,13 +80,14 @@ pub struct AppState {
     file_hashes: Arc<RwLock<FileHashCache>>,
 }
 
+#[derive(Debug)]
 struct JobEntry {
     record: JobRecord,
     tx: Option<broadcast::Sender<JobStreamEvent>>,
     abort_handle: Option<AbortHandle>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct JobStore {
     entries: HashMap<Uuid, JobEntry>,
     order: VecDeque<Uuid>,
@@ -109,7 +124,7 @@ impl AppState {
             return;
         };
         let mut cache = self.file_hashes.write().await;
-        if cache.len() >= 1024 && !cache.contains_key(&path) {
+        if cache.len() >= MAX_CACHED_FILE_HASHES && !cache.contains_key(&path) {
             cache.clear();
         }
         cache.insert(path, (stamp, hash));
@@ -150,7 +165,7 @@ impl AppState {
         if let Some(entry) = store.entries.get_mut(&id) {
             if entry.record.status == JobStatus::Cancelled {
                 handle.abort();
-            } else if !is_terminal(entry.record.status) {
+            } else if !entry.record.status.is_terminal() {
                 entry.abort_handle = Some(handle);
             }
         }
@@ -168,7 +183,7 @@ impl AppState {
     pub async fn mark_succeeded(&self, id: Uuid, duration_ms: u64, result: TaskResult) {
         let mut store = self.jobs.write().await;
         if let Some(entry) = store.entries.get_mut(&id) {
-            if is_terminal(entry.record.status) {
+            if entry.record.status.is_terminal() {
                 return;
             }
             entry.record.status = JobStatus::Succeeded;
@@ -189,7 +204,7 @@ impl AppState {
     pub async fn mark_failed(&self, id: Uuid, duration_ms: u64, error: String) {
         let mut store = self.jobs.write().await;
         if let Some(entry) = store.entries.get_mut(&id) {
-            if is_terminal(entry.record.status) {
+            if entry.record.status.is_terminal() {
                 return;
             }
             entry.record.status = JobStatus::Failed;
@@ -267,18 +282,10 @@ impl AppState {
     }
 }
 
-fn is_terminal(status: JobStatus) -> bool {
-    matches!(
-        status,
-        JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
-    )
-}
-
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis())
 }
 
 #[cfg(test)]
@@ -302,7 +309,13 @@ mod tests {
         assert_eq!(cancelled.status, JobStatus::Cancelled);
 
         state
-            .mark_succeeded(rec.id, 10, TaskResult::Echo { payload: "ok".into() })
+            .mark_succeeded(
+                rec.id,
+                10,
+                TaskResult::Echo {
+                    payload: "ok".into(),
+                },
+            )
             .await;
         state.mark_failed(rec.id, 10, "err".into()).await;
 

@@ -21,7 +21,9 @@ rustup target add aarch64-unknown-linux-musl
 cargo build --release -p offload-server --target aarch64-unknown-linux-musl
 ```
 
-This produces a ~4.4 MB statically linked `aarch64` binary at `target/aarch64-unknown-linux-musl/release/offload-server`.
+This produces a ~5.5 MB statically linked `aarch64` binary at `target/aarch64-unknown-linux-musl/release/offload-server`.
+
+The build targets `cortex-a76` (any flagship phone since 2019); remove `target-cpu` from `.cargo/config.toml` for older devices. If you have an aarch64 musl C toolchain (`brew install filosottile/musl-cross/musl-cross`), add `--features mimalloc` for a faster allocator than musl's.
 
 ## 2. Copy & run on Termux over LAN (no ADB or Rust needed on phone)
 

@@ -1,8 +1,14 @@
-use std::{path::Path, sync::Arc, time::Duration};
+//! `offload-mcp`: Model Context Protocol server over stdio for `offload-server`.
+//!
+//! Reads newline-delimited JSON-RPC 2.0 from stdin and writes responses to stdout.
+//! Each `tools/call` maps to one [`OffloadClient`] operation; when no `url` is given,
+//! the node is auto-discovered once and cached until a call fails.
+
+use std::{error::Error, path::Path, sync::Arc, time::Duration};
 
 use clap::Parser;
-use offload_client::OffloadClient;
-use offload_protocol::{DEFAULT_DISCOVERY_PORT, TaskKind};
+use offload_client::{DEFAULT_POLL_INTERVAL, OffloadClient, discover, discover_first};
+use offload_protocol::{DEFAULT_DISCOVERY_PORT, DEFAULT_DISCOVERY_WAIT, TaskKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
@@ -12,7 +18,10 @@ use tokio::{
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
-#[command(name = "offload-mcp", about = "MCP stdio server for Android/Termux ML offload")]
+#[command(
+    name = "offload-mcp",
+    about = "MCP stdio server for Android/Termux ML offload"
+)]
 struct Cli {
     /// Default offload-server URL (if omitted, auto-discovers on LAN)
     #[arg(long, env = "OFFLOAD_URL")]
@@ -26,6 +35,21 @@ struct Cli {
     #[arg(long, env = "OFFLOAD_DISCOVERY_PORT", default_value_t = DEFAULT_DISCOVERY_PORT)]
     discovery_port: u16,
 }
+
+/// MCP revision this server implements; clients negotiate against it in `initialize`.
+const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// JSON-RPC 2.0 error code for unparseable input.
+const PARSE_ERROR: i64 = -32700;
+/// JSON-RPC 2.0 error code for an unknown method.
+const METHOD_NOT_FOUND: i64 = -32601;
+
+/// Responses buffered between request handlers and the single stdout writer.
+/// Only back-pressures if the MCP host stops reading stdout.
+const RESPONSE_QUEUE_CAPACITY: usize = 128;
+
+/// Tool errors are rendered to text for the MCP host, so any error type will do.
+type ToolResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -52,6 +76,7 @@ struct JsonRpcError {
     message: String,
 }
 
+#[derive(Debug)]
 struct McpState {
     cli: Cli,
     default_client: Mutex<Option<OffloadClient>>,
@@ -71,7 +96,7 @@ async fn main() {
     let state = Arc::new(McpState::new(Cli::parse()));
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
-    let (tx, mut rx) = mpsc::channel::<JsonRpcResponse>(128);
+    let (tx, mut rx) = mpsc::channel::<JsonRpcResponse>(RESPONSE_QUEUE_CAPACITY);
 
     let writer_task = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
@@ -94,7 +119,7 @@ async fn main() {
                     id: Value::Null,
                     result: None,
                     error: Some(JsonRpcError {
-                        code: -32700,
+                        code: PARSE_ERROR,
                         message: format!("parse error: {err}"),
                     }),
                 };
@@ -130,13 +155,18 @@ async fn write_response(stdout: &mut tokio::io::Stdout, resp: &JsonRpcResponse) 
     }
 }
 
-async fn handle_request(state: &McpState, id: Value, method: &str, params: Value) -> JsonRpcResponse {
+async fn handle_request(
+    state: &McpState,
+    id: Value,
+    method: &str,
+    params: Value,
+) -> JsonRpcResponse {
     match method {
         "initialize" => JsonRpcResponse {
             jsonrpc: "2.0",
             id,
             result: Some(json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": { "tools": {} },
                 "serverInfo": {
                     "name": "offload-mcp",
@@ -159,7 +189,10 @@ async fn handle_request(state: &McpState, id: Value, method: &str, params: Value
         },
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-            let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             let uses_default = args.get("url").and_then(Value::as_str).is_none();
             let outcome = call_tool(state, name, args).await;
             if outcome.is_err() && uses_default && state.cli.url.is_none() {
@@ -172,8 +205,8 @@ async fn handle_request(state: &McpState, id: Value, method: &str, params: Value
                     "content": [{ "type": "text", "text": serde_json::to_string_pretty(&val).unwrap_or_default() }],
                     "isError": false
                 }),
-                Err(msg) => json!({
-                    "content": [{ "type": "text", "text": msg }],
+                Err(err) => json!({
+                    "content": [{ "type": "text", "text": err.to_string() }],
                     "isError": true
                 }),
             };
@@ -189,13 +222,17 @@ async fn handle_request(state: &McpState, id: Value, method: &str, params: Value
             id,
             result: None,
             error: Some(JsonRpcError {
-                code: -32601,
+                code: METHOD_NOT_FOUND,
                 message: format!("method not found: {other}"),
             }),
         },
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "static JSON schema data, one entry per tool"
+)]
 fn tool_definitions() -> Value {
     json!([
         {
@@ -327,9 +364,9 @@ fn tool_definitions() -> Value {
     ])
 }
 
-async fn resolve_client(state: &McpState, explicit_url: Option<&str>) -> Result<OffloadClient, String> {
+async fn resolve_client(state: &McpState, explicit_url: Option<&str>) -> ToolResult<OffloadClient> {
     if let Some(url) = explicit_url {
-        return OffloadClient::new(url, state.cli.token.clone()).map_err(|e| e.to_string());
+        return Ok(OffloadClient::new(url, state.cli.token.clone())?);
     }
     // Lock held across discovery so concurrent calls share one discovery round.
     let mut cached = state.default_client.lock().await;
@@ -338,199 +375,163 @@ async fn resolve_client(state: &McpState, explicit_url: Option<&str>) -> Result<
     }
     let url = match state.cli.url.as_deref() {
         Some(u) => u.to_string(),
-        None => OffloadClient::discover_first(state.cli.discovery_port, Duration::from_millis(1500))
-            .await
-            .map_err(|e| e.to_string())?
-            .url,
+        None => {
+            discover_first(state.cli.discovery_port, DEFAULT_DISCOVERY_WAIT)
+                .await?
+                .url
+        }
     };
-    let client = OffloadClient::new(url, state.cli.token.clone()).map_err(|e| e.to_string())?;
+    let client = OffloadClient::new(url, state.cli.token.clone())?;
     *cached = Some(client.clone());
     Ok(client)
 }
 
-async fn execute_task(client: &OffloadClient, task: TaskKind, use_async: bool) -> Result<Value, String> {
-    if use_async {
-        let record = client
-            .run_and_wait(task, Duration::from_millis(500))
-            .await
-            .map_err(|e| e.to_string())?;
-        serde_json::to_value(record).map_err(|e| e.to_string())
+async fn execute_task(
+    client: &OffloadClient,
+    task: TaskKind,
+    use_async: bool,
+) -> ToolResult<Value> {
+    Ok(if use_async {
+        serde_json::to_value(client.run_and_wait(task, DEFAULT_POLL_INTERVAL).await?)?
     } else {
-        let res = client.run(task).await.map_err(|e| e.to_string())?;
-        serde_json::to_value(res).map_err(|e| e.to_string())
-    }
+        serde_json::to_value(client.run(task).await?)?
+    })
 }
 
-async fn call_tool(state: &McpState, name: &str, args: Value) -> Result<Value, String> {
+fn str_arg<'a>(args: &'a Value, key: &str) -> ToolResult<&'a str> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing required '{key}'").into())
+}
+
+fn bool_arg(args: &Value, key: &str, default: bool) -> bool {
+    args.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+
+fn uuid_arg(args: &Value) -> ToolResult<Uuid> {
+    Ok(Uuid::parse_str(str_arg(args, "id")?).map_err(|e| format!("invalid UUID: {e}"))?)
+}
+
+async fn call_tool(state: &McpState, name: &str, args: Value) -> ToolResult<Value> {
     let explicit_url = args.get("url").and_then(Value::as_str);
 
+    if name == "discover_nodes" {
+        let wait = args
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .map_or(DEFAULT_DISCOVERY_WAIT, Duration::from_millis);
+        return Ok(serde_json::to_value(
+            discover(state.cli.discovery_port, wait).await?,
+        )?);
+    }
+
+    let client = || resolve_client(state, explicit_url);
+
     match name {
-        "discover_nodes" => {
-            let ms = args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(1500);
-            let nodes =
-                OffloadClient::discover(state.cli.discovery_port, Duration::from_millis(ms))
-                    .await
-                    .map_err(|e| e.to_string())?;
-            serde_json::to_value(nodes).map_err(|e| e.to_string())
+        "node_info" => Ok(serde_json::to_value(client().await?.info().await?)?),
+        "list_models" => Ok(serde_json::to_value(client().await?.list_models().await?)?),
+        "get_job" => {
+            let id = uuid_arg(&args)?;
+            Ok(serde_json::to_value(client().await?.job_status(id).await?)?)
         }
-        "node_info" => {
-            let client = resolve_client(state, explicit_url).await?;
-            let info = client.info().await.map_err(|e| e.to_string())?;
-            serde_json::to_value(info).map_err(|e| e.to_string())
+        "cancel_job" => {
+            let id = uuid_arg(&args)?;
+            Ok(serde_json::to_value(client().await?.cancel_job(id).await?)?)
         }
         "run_llama" => {
-            let client = resolve_client(state, explicit_url).await?;
-            let model = args
-                .get("model")
-                .and_then(Value::as_str)
-                .ok_or("missing required 'model'")?
-                .to_string();
-            let prompt = args
-                .get("prompt")
-                .and_then(Value::as_str)
-                .ok_or("missing required 'prompt'")?
-                .to_string();
-            let max_tokens = args
-                .get("max_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(256) as u32;
-            let temperature = args
-                .get("temperature")
-                .and_then(Value::as_f64)
-                .map(|t| t as f32);
-            let use_async = args.get("async").and_then(Value::as_bool).unwrap_or(true);
-
-            execute_task(
-                &client,
-                TaskKind::LlamaCompletion {
-                    model,
-                    prompt,
-                    max_tokens,
-                    temperature,
-                    extra_args: vec![],
-                },
-                use_async,
-            )
-            .await
+            let task = TaskKind::LlamaCompletion {
+                model: str_arg(&args, "model")?.to_string(),
+                prompt: str_arg(&args, "prompt")?.to_string(),
+                max_tokens: args
+                    .get("max_tokens")
+                    .and_then(Value::as_u64)
+                    .map_or(Ok(256), u32::try_from)?,
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "f64 -> f32 temperature; precision loss is harmless"
+                )]
+                temperature: args
+                    .get("temperature")
+                    .and_then(Value::as_f64)
+                    .map(|t| t as f32),
+                extra_args: vec![],
+            };
+            execute_task(&client().await?, task, bool_arg(&args, "async", true)).await
         }
         "run_command" => {
-            let client = resolve_client(state, explicit_url).await?;
-            let program = args
-                .get("program")
-                .and_then(Value::as_str)
-                .ok_or("missing required 'program'")?
-                .to_string();
-            let cmd_args: Vec<String> = args
-                .get("args")
-                .cloned()
-                .map(serde_json::from_value)
-                .transpose()
-                .map_err(|e| format!("invalid 'args': {e}"))?
-                .unwrap_or_default();
-            let stdin = args.get("stdin").and_then(Value::as_str).map(str::to_string);
-            let timeout_secs = args.get("timeout_secs").and_then(Value::as_u64);
-            let use_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
-
-            execute_task(
-                &client,
-                TaskKind::Command {
-                    program,
-                    args: cmd_args,
-                    stdin,
-                    timeout_secs,
-                },
-                use_async,
-            )
-            .await
+            let task = TaskKind::Command {
+                program: str_arg(&args, "program")?.to_string(),
+                args: args
+                    .get("args")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|e| format!("invalid 'args': {e}"))?
+                    .unwrap_or_default(),
+                stdin: args
+                    .get("stdin")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                timeout_secs: args.get("timeout_secs").and_then(Value::as_u64),
+            };
+            execute_task(&client().await?, task, bool_arg(&args, "async", false)).await
         }
         "run_task" => {
-            let client = resolve_client(state, explicit_url).await?;
             let task_val = args.get("task").cloned().ok_or("missing required 'task'")?;
             let task: TaskKind =
                 serde_json::from_value(task_val).map_err(|e| format!("invalid 'task': {e}"))?;
-            let use_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
-            execute_task(&client, task, use_async).await
+            execute_task(&client().await?, task, bool_arg(&args, "async", false)).await
         }
-        "get_job" => {
-            let client = resolve_client(state, explicit_url).await?;
-            let id_str = args
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or("missing required 'id'")?;
-            let id = Uuid::parse_str(id_str).map_err(|e| format!("invalid UUID: {e}"))?;
-            let job = client.job_status(id).await.map_err(|e| e.to_string())?;
-            serde_json::to_value(job).map_err(|e| e.to_string())
-        }
-        "push_file" => {
-            let client = resolve_client(state, explicit_url).await?;
-            let local_str = args
-                .get("local_path")
-                .and_then(Value::as_str)
-                .ok_or("missing required 'local_path'")?;
-            let local_path = Path::new(local_str);
-            let remote_path = match args.get("remote_path").and_then(Value::as_str) {
-                Some(r) => r.to_string(),
-                None => local_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .ok_or("local_path has no valid UTF-8 filename")?
-                    .to_string(),
-            };
-            let chunk_mb = args.get("chunk_mb").and_then(Value::as_u64).unwrap_or(4) as usize;
-            let summary = client
-                .upload_file(local_path, &remote_path, chunk_mb.max(1) * 1024 * 1024, |_| {})
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(json!({
-                "remote_path": summary.remote_path,
-                "total_bytes": summary.total_bytes,
-                "resumed_bytes": summary.resumed_bytes,
-                "uploaded_bytes": summary.uploaded_bytes,
-                "elapsed_secs": summary.elapsed.as_secs_f64(),
-                "already_existed": summary.already_existed,
-            }))
-        }
-        "pull_file" => {
-            let client = resolve_client(state, explicit_url).await?;
-            let remote_path = args
-                .get("remote_path")
-                .and_then(Value::as_str)
-                .ok_or("missing required 'remote_path'")?;
-            let local_path = args
-                .get("local_path")
-                .and_then(Value::as_str)
-                .ok_or("missing required 'local_path'")?;
-            let summary = client
-                .download_file(remote_path, Path::new(local_path), |_| {})
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(json!({
-                "remote_path": summary.remote_path,
-                "local_path": local_path,
-                "total_bytes": summary.total_bytes,
-                "resumed_bytes": summary.resumed_bytes,
-                "downloaded_bytes": summary.uploaded_bytes,
-                "elapsed_secs": summary.elapsed.as_secs_f64(),
-                "already_existed": summary.already_existed,
-            }))
-        }
-        "list_models" => {
-            let client = resolve_client(state, explicit_url).await?;
-            let models = client.list_models().await.map_err(|e| e.to_string())?;
-            serde_json::to_value(models).map_err(|e| e.to_string())
-        }
-        "cancel_job" => {
-            let client = resolve_client(state, explicit_url).await?;
-            let id_str = args
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or("missing required 'id'")?;
-            let id = Uuid::parse_str(id_str).map_err(|e| format!("invalid UUID: {e}"))?;
-            let job = client.cancel_job(id).await.map_err(|e| e.to_string())?;
-            serde_json::to_value(job).map_err(|e| e.to_string())
-        }
-        other => Err(format!("unknown tool: {other}")),
+        "push_file" => push_file(&client().await?, &args).await,
+        "pull_file" => pull_file(&client().await?, &args).await,
+        other => Err(format!("unknown tool: {other}").into()),
     }
+}
+
+async fn push_file(client: &OffloadClient, args: &Value) -> ToolResult<Value> {
+    let local_path = Path::new(str_arg(args, "local_path")?);
+    let remote_path = match args.get("remote_path").and_then(Value::as_str) {
+        Some(r) => r.to_string(),
+        None => local_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("local_path has no valid UTF-8 filename")?
+            .to_string(),
+    };
+    let chunk_mb = usize::try_from(args.get("chunk_mb").and_then(Value::as_u64).unwrap_or(4))?;
+    let summary = client
+        .upload_file(
+            local_path,
+            &remote_path,
+            chunk_mb.max(1) * 1024 * 1024,
+            |_| {},
+        )
+        .await?;
+    Ok(json!({
+        "remote_path": summary.remote_path,
+        "total_bytes": summary.total_bytes,
+        "resumed_bytes": summary.resumed_bytes,
+        "uploaded_bytes": summary.uploaded_bytes,
+        "elapsed_secs": summary.elapsed.as_secs_f64(),
+        "already_existed": summary.already_existed,
+    }))
+}
+
+async fn pull_file(client: &OffloadClient, args: &Value) -> ToolResult<Value> {
+    let remote_path = str_arg(args, "remote_path")?;
+    let local_path = str_arg(args, "local_path")?;
+    let summary = client
+        .download_file(remote_path, Path::new(local_path), |_| {})
+        .await?;
+    Ok(json!({
+        "remote_path": summary.remote_path,
+        "local_path": local_path,
+        "total_bytes": summary.total_bytes,
+        "resumed_bytes": summary.resumed_bytes,
+        "downloaded_bytes": summary.uploaded_bytes,
+        "elapsed_secs": summary.elapsed.as_secs_f64(),
+        "already_existed": summary.already_existed,
+    }))
 }
 
 #[cfg(test)]
@@ -554,7 +555,23 @@ mod tests {
 
         let list = handle_request(&state, json!(2), "tools/list", json!({})).await;
         assert!(list.error.is_none());
-        let tools = list.result.unwrap()["tools"].as_array().unwrap().len();
-        assert_eq!(tools, 10);
+    }
+
+    #[tokio::test]
+    async fn every_listed_tool_is_dispatched() {
+        // Port 9 (discard) refuses connections, so each call fails fast after dispatch.
+        let state = McpState::new(test_cli());
+        for tool in tool_definitions().as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            let args = json!({ "url": "http://127.0.0.1:9", "timeout_ms": 1 });
+            if let Err(err) = call_tool(&state, name, args).await {
+                assert!(
+                    !err.to_string().starts_with("unknown tool"),
+                    "{name} is listed but not handled"
+                );
+            }
+        }
+        let err = call_tool(&state, "nope", json!({})).await.unwrap_err();
+        assert!(err.to_string().starts_with("unknown tool"));
     }
 }

@@ -1,3 +1,6 @@
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
-rustflags = ["-C", "linker-flavor=ld.lld"]
+# target-cpu (M-TARGET-CPU): cortex-a76 = ARMv8.2-A + dotprod/fp16/LSE, present on every
+# flagship SoC since 2019 (including the OnePlus 15's Oryon cores). Phones with only
+# older A53/A73-class cores would SIGILL; drop this flag to build for those.
+rustflags = ["-C", "linker-flavor=ld.lld", "-C", "target-cpu=cortex-a76"]

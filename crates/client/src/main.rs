@@ -1,16 +1,31 @@
+//! `offload-client`: command-line front end for `offload-server`.
+//!
+//! Prints results as JSON on stdout and progress/diagnostics on stderr, so output can be piped.
+
 use std::{
+    error::Error,
     io::{Write, stderr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use clap::{Parser, Subcommand};
-use offload_client::{OffloadClient, TransferProgress};
-use offload_protocol::{DEFAULT_DISCOVERY_PORT, JobStreamEvent, TaskKind};
+use offload_client::{
+    DEFAULT_POLL_INTERVAL, OffloadClient, TransferProgress, TransferSummary, discover,
+    discover_first,
+};
+use offload_protocol::{
+    DEFAULT_DISCOVERY_PORT, DEFAULT_DISCOVERY_WAIT, JobStreamEvent, OutputStream, TaskKind,
+};
 use uuid::Uuid;
 
+type CliResult = Result<(), Box<dyn Error>>;
+
 #[derive(Debug, Parser)]
-#[command(name = "offload-client", about = "Client CLI for Android/Termux ML offload")]
+#[command(
+    name = "offload-client",
+    about = "Client CLI for Android/Termux ML offload"
+)]
 struct Cli {
     /// Base URL of offload-server (if omitted, auto-discovers on LAN)
     #[arg(long, env = "OFFLOAD_URL")]
@@ -32,7 +47,8 @@ struct Cli {
 enum Commands {
     /// Discover offload-server nodes on the local network
     Discover {
-        #[arg(long, default_value_t = 1500)]
+        /// How long to wait for replies, in milliseconds
+        #[arg(long, default_value_t = DEFAULT_DISCOVERY_WAIT.as_millis().try_into().unwrap_or(u64::MAX))]
         timeout_ms: u64,
     },
 
@@ -124,25 +140,21 @@ async fn main() {
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> CliResult {
     let cli = Cli::parse();
 
     if let Commands::Discover { timeout_ms } = cli.command {
-        let nodes =
-            OffloadClient::discover(cli.discovery_port, Duration::from_millis(timeout_ms)).await?;
+        let nodes = discover(cli.discovery_port, Duration::from_millis(timeout_ms)).await?;
         println!("{}", serde_json::to_string_pretty(&nodes)?);
         return Ok(());
     }
 
-    let url = match cli.url {
-        Some(u) => u,
-        None => {
-            let node =
-                OffloadClient::discover_first(cli.discovery_port, Duration::from_millis(1500))
-                    .await?;
-            eprintln!("discovered '{}' at {}", node.name, node.url);
-            node.url
-        }
+    let url = if let Some(u) = cli.url {
+        u
+    } else {
+        let node = discover_first(cli.discovery_port, DEFAULT_DISCOVERY_WAIT).await?;
+        eprintln!("discovered '{}' at {}", node.name, node.url);
+        node.url
     };
 
     let client = OffloadClient::new(url, cli.token)?;
@@ -172,26 +184,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
 
-        Commands::MatmulBench { size } => {
-            let len = size * size;
-            let a = vec![1.0_f32; len];
-            let b = vec![0.5_f32; len];
-            let started = Instant::now();
-            let res = client
-                .run(TaskKind::MatMul {
-                    rows_a: size,
-                    cols_a: size,
-                    cols_b: size,
-                    a,
-                    b,
-                })
-                .await?;
-            let rtt = started.elapsed().as_millis();
-            println!(
-                "matmul {size}x{size}: rtt_ms={rtt} server_duration_ms={}",
-                res.duration_ms
-            );
-        }
+        Commands::MatmulBench { size } => matmul_bench(&client, size).await?,
 
         Commands::Llama {
             model,
@@ -245,75 +238,84 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&jobs)?);
         }
 
-        Commands::Push { file, to, chunk_mb } => {
-            let remote_path = match to {
-                Some(p) => p,
-                None => file
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .ok_or("local file has no valid UTF-8 filename")?
-                    .to_string(),
-            };
-            let chunk_bytes = chunk_mb.max(1) * 1024 * 1024;
-            let summary = client
-                .upload_file(&file, &remote_path, chunk_bytes, render_progress)
-                .await?;
-            if summary.already_existed {
-                println!(
-                    "already up to date: {} ({})",
-                    summary.remote_path,
-                    format_bytes(summary.total_bytes as f64)
-                );
-            } else {
-                eprintln!();
-                let avg_bps = summary.uploaded_bytes as f64 / summary.elapsed.as_secs_f64().max(1e-4);
-                println!(
-                    "completed {} ({}, resumed {}, avg {}/s in {:.2}s)",
-                    summary.remote_path,
-                    format_bytes(summary.total_bytes as f64),
-                    format_bytes(summary.resumed_bytes as f64),
-                    format_bytes(avg_bps),
-                    summary.elapsed.as_secs_f64()
-                );
-            }
-        }
-
-        Commands::Pull { remote_path, to } => {
-            let local_path = match to {
-                Some(p) => p,
-                None => {
-                    let name = PathBuf::from(&remote_path)
-                        .file_name()
-                        .map(PathBuf::from)
-                        .ok_or("remote_path has no filename")?;
-                    name
-                }
-            };
-            let summary = client
-                .download_file(&remote_path, &local_path, render_progress)
-                .await?;
-            if summary.already_existed {
-                println!(
-                    "already up to date: {} ({})",
-                    local_path.display(),
-                    format_bytes(summary.total_bytes as f64)
-                );
-            } else {
-                eprintln!();
-                let avg_bps = summary.uploaded_bytes as f64 / summary.elapsed.as_secs_f64().max(1e-4);
-                println!(
-                    "downloaded {} ({}, resumed {}, avg {}/s in {:.2}s)",
-                    local_path.display(),
-                    format_bytes(summary.total_bytes as f64),
-                    format_bytes(summary.resumed_bytes as f64),
-                    format_bytes(avg_bps),
-                    summary.elapsed.as_secs_f64()
-                );
-            }
-        }
+        Commands::Push { file, to, chunk_mb } => push(&client, &file, to, chunk_mb).await?,
+        Commands::Pull { remote_path, to } => pull(&client, &remote_path, to).await?,
     }
 
     Ok(())
+}
+
+async fn matmul_bench(client: &OffloadClient, size: usize) -> CliResult {
+    let len = size * size;
+    let started = Instant::now();
+    let res = client
+        .run(TaskKind::MatMul {
+            rows_a: size,
+            cols_a: size,
+            cols_b: size,
+            a: vec![1.0_f32; len],
+            b: vec![0.5_f32; len],
+        })
+        .await?;
+    let rtt = started.elapsed().as_millis();
+    println!(
+        "matmul {size}x{size}: rtt_ms={rtt} server_duration_ms={}",
+        res.duration_ms
+    );
+    Ok(())
+}
+
+async fn push(
+    client: &OffloadClient,
+    file: &Path,
+    to: Option<String>,
+    chunk_mb: usize,
+) -> CliResult {
+    let remote_path = match to {
+        Some(p) => p,
+        None => file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("local file has no valid UTF-8 filename")?
+            .to_string(),
+    };
+    let chunk_bytes = chunk_mb.max(1) * 1024 * 1024;
+    let summary = client
+        .upload_file(file, &remote_path, chunk_bytes, render_progress)
+        .await?;
+    print_summary("completed", &summary.remote_path, &summary);
+    Ok(())
+}
+
+async fn pull(client: &OffloadClient, remote_path: &str, to: Option<PathBuf>) -> CliResult {
+    let local_path = match to {
+        Some(p) => p,
+        None => Path::new(remote_path)
+            .file_name()
+            .map(PathBuf::from)
+            .ok_or("remote_path has no filename")?,
+    };
+    let summary = client
+        .download_file(remote_path, &local_path, render_progress)
+        .await?;
+    print_summary("downloaded", &local_path.display().to_string(), &summary);
+    Ok(())
+}
+
+fn print_summary(verb: &str, name: &str, summary: &TransferSummary) {
+    let total = format_bytes(summary.total_bytes as f64);
+    if summary.already_existed {
+        println!("already up to date: {name} ({total})");
+        return;
+    }
+    eprintln!();
+    let secs = summary.elapsed.as_secs_f64();
+    let avg_bps = summary.uploaded_bytes as f64 / secs.max(1e-4);
+    println!(
+        "{verb} {name} ({total}, resumed {}, avg {}/s in {secs:.2}s)",
+        format_bytes(summary.resumed_bytes as f64),
+        format_bytes(avg_bps),
+    );
 }
 
 async fn execute_cli_task(
@@ -321,15 +323,13 @@ async fn execute_cli_task(
     task: TaskKind,
     use_async: bool,
     stream: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult {
     if stream {
         let job = client.submit(task).await?;
         eprintln!("job_id={}", job.id);
         stream_to_console(client, job.id).await?;
     } else if use_async {
-        let record = client
-            .run_and_wait(task, Duration::from_millis(500))
-            .await?;
+        let record = client.run_and_wait(task, DEFAULT_POLL_INTERVAL).await?;
         println!("{}", serde_json::to_string_pretty(&record)?);
     } else {
         let res = client.run(task).await?;
@@ -338,14 +338,11 @@ async fn execute_cli_task(
     Ok(())
 }
 
-async fn stream_to_console(
-    client: &OffloadClient,
-    id: Uuid,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn stream_to_console(client: &OffloadClient, id: Uuid) -> CliResult {
     client
         .stream_job(id, |ev| match ev {
             JobStreamEvent::Output { stream, line } => {
-                if stream == "stderr" {
+                if stream == OutputStream::Stderr {
                     eprintln!("[stderr] {line}");
                 } else {
                     println!("{line}");
@@ -356,7 +353,7 @@ async fn stream_to_console(
                 duration_ms,
                 error,
             } => {
-                eprintln!("[done] status={status:?} duration_ms={duration_ms:?} error={error:?}");
+                eprintln!("[done] status={status} duration_ms={duration_ms:?} error={error:?}");
             }
         })
         .await?;
@@ -370,16 +367,17 @@ fn render_progress(p: TransferProgress) {
     } else {
         (p.bytes_done as f64 / p.total_bytes as f64) * 100.0
     };
-    let filled = ((pct / 100.0) * BAR_WIDTH as f64).round() as usize;
-    let filled = filled.min(BAR_WIDTH);
+    let filled = if p.total_bytes == 0 {
+        BAR_WIDTH
+    } else {
+        let cells = p.bytes_done.min(p.total_bytes) * BAR_WIDTH as u64 / p.total_bytes;
+        usize::try_from(cells).unwrap_or(BAR_WIDTH)
+    };
     let empty = BAR_WIDTH - filled;
 
     let bar: String = "█".repeat(filled) + &"░".repeat(empty);
     let speed = format!("{}/s", format_bytes(p.speed_bps));
-    let eta = p
-        .eta_secs
-        .map(format_eta)
-        .unwrap_or_else(|| "--:--".to_string());
+    let eta = p.eta_secs.map_or_else(|| "--:--".to_string(), format_eta);
     let resume_tag = if p.resumed_bytes > 0 {
         format!(" | resumed {}", format_bytes(p.resumed_bytes as f64))
     } else {

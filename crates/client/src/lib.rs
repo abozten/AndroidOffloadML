@@ -1,6 +1,24 @@
+//! Async client for `offload-server`, the Android/Termux ML offload worker.
+//!
+//! [`OffloadClient`] wraps the HTTP API: synchronous runs, async jobs with SSE
+//! streaming, and resumable BLAKE3-verified file transfer. [`discover`] and
+//! [`discover_first`] find servers on the LAN when no URL is configured.
+//!
+//! ```no_run
+//! # async fn demo() -> Result<(), offload_client::ClientError> {
+//! use offload_client::{OffloadClient, discover_first};
+//! use offload_protocol::{DEFAULT_DISCOVERY_PORT, DEFAULT_DISCOVERY_WAIT, TaskKind};
+//!
+//! let node = discover_first(DEFAULT_DISCOVERY_PORT, DEFAULT_DISCOVERY_WAIT).await?;
+//! let client = OffloadClient::new(node.url, None)?;
+//! let res = client.run(TaskKind::Echo { payload: "hi".into() }).await?;
+//! println!("{} ms", res.duration_ms);
+//! # Ok(()) }
+//! ```
+
 use std::{
     collections::HashSet,
-    io::{Read, SeekFrom},
+    io::{self, Read, SeekFrom},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::{Path, PathBuf},
     sync::{
@@ -24,24 +42,59 @@ use tokio::{
 };
 use uuid::Uuid;
 
+/// Error returned by every fallible [`OffloadClient`] operation.
 #[derive(Debug, Error)]
 pub enum ClientError {
+    /// Connection, TLS, timeout, or response-decoding failure.
     #[error("http transport error: {0}")]
-    Transport(#[from] reqwest::Error),
+    Transport(#[from] TransportError),
+    /// Local file or socket I/O failure.
     #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
+    /// Discovery finished without any server replying.
     #[error("no offload servers discovered on LAN")]
     NoNodesDiscovered,
+    /// A transferred file's BLAKE3 digest did not match the other side's.
     #[error("integrity check failed: expected blake3 {expected}, got {actual}")]
     ChecksumMismatch { expected: String, actual: String },
+    /// The server answered with a non-2xx HTTP `status` code.
     #[error("server returned {status}: {message}")]
-    Api { status: StatusCode, message: String },
+    Api { status: u16, message: String },
+    /// An async job ended `failed` or `cancelled`.
     #[error("job {0} failed: {1}")]
     JobFailed(Uuid, String),
 }
 
-/// Live progress snapshot emitted during a resumable file upload.
-#[derive(Debug, Clone)]
+/// Opaque HTTP transport failure; keeps `reqwest` out of this crate's public API.
+#[derive(Debug, Error)]
+#[error(transparent)]
+pub struct TransportError(reqwest::Error);
+
+impl From<reqwest::Error> for ClientError {
+    fn from(err: reqwest::Error) -> Self {
+        Self::Transport(TransportError(err))
+    }
+}
+
+/// TCP connect timeout. Phones on Wi-Fi power-save can take a few seconds to answer.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Max gap between bytes on a response, not total request time.
+///
+/// Sync `/v1/run` llama tasks stay silent until done, so this caps how long a sync
+/// request can run; use async jobs for anything longer.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Floor for upload chunk size: smaller chunks make per-request overhead dominate.
+const MIN_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Poll interval the CLI and MCP use for [`OffloadClient::run_and_wait`].
+///
+/// Half a second keeps latency low while costing the phone ~2 tiny requests/s.
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Live progress snapshot emitted during a resumable file transfer.
+#[derive(Debug, Clone, Copy)]
 pub struct TransferProgress {
     pub bytes_done: u64,
     pub total_bytes: u64,
@@ -70,10 +123,17 @@ pub struct OffloadClient {
 }
 
 impl OffloadClient {
+    /// Creates a client for the server at `base_url` (e.g. `http://192.168.1.20:7878`).
+    ///
+    /// An empty `token` is treated as no token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Transport`] if the HTTP client cannot be built (TLS init).
     pub fn new(base_url: impl Into<String>, token: Option<String>) -> Result<Self, ClientError> {
         let http = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(60))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .build()?;
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -82,8 +142,17 @@ impl OffloadClient {
         })
     }
 
+    /// Checks the unauthenticated `/health` endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Transport`] if unreachable, [`ClientError::Api`] on non-2xx.
     pub async fn health(&self) -> Result<(), ClientError> {
-        let res = self.http.get(format!("{}/health", self.base_url)).send().await?;
+        let res = self
+            .http
+            .get(format!("{}/health", self.base_url))
+            .send()
+            .await?;
         if res.status().is_success() {
             Ok(())
         } else {
@@ -91,16 +160,31 @@ impl OffloadClient {
         }
     }
 
+    /// Fetches hardware and capability info (`GET /v1/info`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Transport`] on network failure or [`ClientError::Api`] on non-2xx.
     pub async fn info(&self) -> Result<NodeInfo, ClientError> {
         let req = self.auth(self.http.get(format!("{}/v1/info", self.base_url)));
         send_json(req).await
     }
 
+    /// Lists model files in the server's `--models-dir`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Transport`] on network failure or [`ClientError::Api`] on non-2xx.
     pub async fn list_models(&self) -> Result<Vec<ModelEntry>, ClientError> {
         let req = self.auth(self.http.get(format!("{}/v1/models", self.base_url)));
         send_json(req).await
     }
 
+    /// Runs `task` synchronously and returns its result (`POST /v1/run`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Transport`] on network failure or [`ClientError::Api`] on non-2xx.
     pub async fn run(&self, task: TaskKind) -> Result<RunTaskResponse, ClientError> {
         let req = self
             .auth(self.http.post(format!("{}/v1/run", self.base_url)))
@@ -108,6 +192,11 @@ impl OffloadClient {
         send_json(req).await
     }
 
+    /// Queues `task` as an async job and returns its initial record (`POST /v1/jobs`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Transport`] on network failure or [`ClientError::Api`] on non-2xx.
     pub async fn submit(&self, task: TaskKind) -> Result<JobRecord, ClientError> {
         let req = self
             .auth(self.http.post(format!("{}/v1/jobs", self.base_url)))
@@ -115,28 +204,52 @@ impl OffloadClient {
         send_json(req).await
     }
 
+    /// Fetches the current record of async job `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Transport`] on network failure or [`ClientError::Api`] on non-2xx.
     pub async fn job_status(&self, id: Uuid) -> Result<JobRecord, ClientError> {
         let req = self.auth(self.http.get(format!("{}/v1/jobs/{id}", self.base_url)));
         send_json(req).await
     }
 
+    /// Lists recent async jobs, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Transport`] on network failure or [`ClientError::Api`] on non-2xx.
     pub async fn list_jobs(&self) -> Result<Vec<JobRecord>, ClientError> {
         let req = self.auth(self.http.get(format!("{}/v1/jobs", self.base_url)));
         send_json(req).await
     }
 
+    /// Cancels async job `id` if still queued or running, returning its record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Transport`] on network failure or [`ClientError::Api`] on non-2xx.
     pub async fn cancel_job(&self, id: Uuid) -> Result<JobRecord, ClientError> {
         let req = self.auth(self.http.delete(format!("{}/v1/jobs/{id}", self.base_url)));
         send_json(req).await
     }
 
-    /// Stream live SSE output and completion events for an async job.
+    /// Streams live SSE output and the final `Done` event of async job `id` into `on_event`.
+    ///
+    /// Returns after `Done`, or when the server closes the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Transport`] on network failure or [`ClientError::Api`] on non-2xx.
     pub async fn stream_job<F>(&self, id: Uuid, mut on_event: F) -> Result<(), ClientError>
     where
         F: FnMut(JobStreamEvent),
     {
         let mut res = self
-            .auth(self.http.get(format!("{}/v1/jobs/{id}/stream", self.base_url)))
+            .auth(
+                self.http
+                    .get(format!("{}/v1/jobs/{id}/stream", self.base_url)),
+            )
             .send()
             .await?;
         if !res.status().is_success() {
@@ -165,7 +278,11 @@ impl OffloadClient {
         Ok(())
     }
 
-    /// Query server-side upload status for a remote relative path.
+    /// Queries server-side upload status for a path relative to `--files-dir`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Transport`] on network failure or [`ClientError::Api`] on non-2xx.
     pub async fn file_status(&self, remote_path: &str) -> Result<FileTransferStatus, ClientError> {
         let req = self
             .auth(self.http.get(format!("{}/v1/files/status", self.base_url)))
@@ -173,7 +290,16 @@ impl OffloadClient {
         send_json(req).await
     }
 
-    /// Upload a local file in chunks with automatic resume and live speed/ETA callbacks.
+    /// Uploads `local_path` to `remote_path` in chunks, resuming any partial upload.
+    ///
+    /// Skips the transfer when the server already has an identical file (by BLAKE3).
+    /// `on_progress` receives throttled speed/ETA snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Io`] if the local file can't be read or shrinks mid-upload,
+    /// [`ClientError::ChecksumMismatch`] if the server's digest differs, and transport or
+    /// API errors from the server.
     pub async fn upload_file<F>(
         &self,
         local_path: &Path,
@@ -213,17 +339,19 @@ impl OffloadClient {
         let resumed_bytes = offset;
         file.seek(SeekFrom::Start(offset)).await?;
 
-        let chunk_cap = chunk_size.max(64 * 1024);
-        let mut buf = vec![0_u8; chunk_cap];
+        let chunk_cap = chunk_size.max(MIN_CHUNK_BYTES) as u64;
         let mut tracker = ProgressTracker::new(total_bytes, resumed_bytes);
 
         on_progress(tracker.initial());
 
         loop {
-            let n = read_full_chunk(&mut file, &mut buf).await?;
+            // A fresh Vec per chunk is moved into the request body: no zeroing, no copy.
+            let mut chunk = Vec::new();
+            (&mut file).take(chunk_cap).read_to_end(&mut chunk).await?;
+            let n = chunk.len() as u64;
             if n == 0 && offset < total_bytes {
-                return Err(ClientError::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
+                return Err(ClientError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
                     format!(
                         "local file shrunk during upload: read 0 bytes at offset {offset} of {total_bytes}"
                     ),
@@ -237,13 +365,13 @@ impl OffloadClient {
                     ("offset", &offset.to_string()),
                     ("total_size", &total_bytes.to_string()),
                 ])
-                .body(buf[..n].to_vec());
+                .body(chunk);
 
             let resp: ChunkUploadResponse = send_json(req).await?;
             offset = resp.partial_size;
 
             let done = resp.completed || offset >= total_bytes;
-            if let Some(progress) = tracker.update(n as u64, offset, done) {
+            if let Some(progress) = tracker.update(n, offset, done) {
                 on_progress(progress);
             }
 
@@ -271,7 +399,16 @@ impl OffloadClient {
         })
     }
 
-    /// Download a file from `--files-dir` with HTTP Range resume, speed/ETA, and BLAKE3 verification.
+    /// Downloads `remote_path` from `--files-dir` to `local_path` with Range resume.
+    ///
+    /// Data is staged in `<local_path>.part` and renamed into place only after the
+    /// size and BLAKE3 digest check out. Skips the transfer if `local_path` already matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Api`] (404) if the remote file doesn't exist,
+    /// [`ClientError::Io`] on local I/O failure or a truncated response,
+    /// [`ClientError::ChecksumMismatch`] if the digest differs, and transport errors.
     pub async fn download_file<F>(
         &self,
         remote_path: &str,
@@ -284,31 +421,25 @@ impl OffloadClient {
         let started = Instant::now();
         let status = self.file_status(remote_path).await?;
         let total_bytes = status.final_size.ok_or_else(|| ClientError::Api {
-            status: StatusCode::NOT_FOUND,
+            status: StatusCode::NOT_FOUND.as_u16(),
             message: format!("remote file '{remote_path}' does not exist"),
         })?;
 
-        if local_path.exists()
-            && fs::metadata(local_path).await?.len() == total_bytes
-            && let Some(expected) = &status.blake3
-        {
-            let local_hash = compute_blake3_blocking(local_path).await?;
-            if &local_hash == expected {
-                return Ok(TransferSummary {
-                    remote_path: remote_path.to_string(),
-                    total_bytes,
-                    resumed_bytes: total_bytes,
-                    uploaded_bytes: 0,
-                    elapsed: started.elapsed(),
-                    already_existed: true,
-                });
-            }
+        if local_matches(local_path, total_bytes, status.blake3.as_deref()).await? {
+            return Ok(TransferSummary {
+                remote_path: remote_path.to_string(),
+                total_bytes,
+                resumed_bytes: total_bytes,
+                uploaded_bytes: 0,
+                elapsed: started.elapsed(),
+                already_existed: true,
+            });
         }
 
         let part_path = {
             let mut os = local_path.as_os_str().to_os_string();
             os.push(".part");
-            std::path::PathBuf::from(os)
+            PathBuf::from(os)
         };
         if let Some(parent) = part_path.parent()
             && !parent.as_os_str().is_empty()
@@ -316,10 +447,7 @@ impl OffloadClient {
             fs::create_dir_all(parent).await?;
         }
 
-        let mut offset = fs::metadata(&part_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let mut offset = fs::metadata(&part_path).await.map(|m| m.len()).unwrap_or(0);
         if offset > total_bytes {
             offset = 0;
         }
@@ -327,6 +455,7 @@ impl OffloadClient {
 
         let mut out_file = OpenOptions::new()
             .create(true)
+            .truncate(false) // keep existing bytes: they are the resume point
             .write(true)
             .read(true)
             .open(&part_path)
@@ -335,7 +464,10 @@ impl OffloadClient {
         out_file.seek(SeekFrom::Start(offset)).await?;
 
         let mut req = self
-            .auth(self.http.get(format!("{}/v1/files/download", self.base_url)))
+            .auth(
+                self.http
+                    .get(format!("{}/v1/files/download", self.base_url)),
+            )
             .query(&[("path", remote_path)]);
         if offset > 0 && offset < total_bytes {
             req = req.header(header::RANGE, format!("bytes={offset}-"));
@@ -359,7 +491,8 @@ impl OffloadClient {
             out_file.write_all(&chunk).await?;
             offset += chunk.len() as u64;
 
-            if let Some(progress) = tracker.update(chunk.len() as u64, offset, offset >= total_bytes)
+            if let Some(progress) =
+                tracker.update(chunk.len() as u64, offset, offset >= total_bytes)
             {
                 on_progress(progress);
             }
@@ -371,8 +504,8 @@ impl OffloadClient {
         // A clean early EOF must not be promoted to the final file (matters when the
         // server sent no blake3). The .part stays so the next call resumes from here.
         if offset != total_bytes {
-            return Err(ClientError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
+            return Err(ClientError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
                 format!("download ended at {offset} of {total_bytes} bytes"),
             )));
         }
@@ -396,7 +529,12 @@ impl OffloadClient {
         })
     }
 
-    /// Submit a task asynchronously and poll until it reaches a terminal state.
+    /// Submits `task` as an async job and polls every `poll_interval` until it finishes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::JobFailed`] if the job fails or is cancelled, plus any
+    /// transport or API error from submitting or polling.
     pub async fn run_and_wait(
         &self,
         task: TaskKind,
@@ -427,31 +565,44 @@ impl OffloadClient {
             None => req,
         }
     }
-
-    /// Broadcast/multicast a discovery probe on the LAN and collect all responding nodes.
-    pub async fn discover(
-        discovery_port: u16,
-        wait: Duration,
-    ) -> Result<Vec<DiscoveredNode>, ClientError> {
-        discover_nodes(discovery_port, wait, false).await
-    }
-
-    /// Return the first offload server that responds on the LAN.
-    pub async fn discover_first(
-        discovery_port: u16,
-        wait: Duration,
-    ) -> Result<DiscoveredNode, ClientError> {
-        let mut nodes = discover_nodes(discovery_port, wait, true).await?;
-        nodes.pop().ok_or(ClientError::NoNodesDiscovered)
-    }
 }
+
+/// Broadcasts/multicasts a discovery probe and collects every node that replies within `wait`.
+///
+/// # Errors
+///
+/// Returns [`ClientError::Io`] if the UDP socket can't be bound or read.
+pub async fn discover(
+    discovery_port: u16,
+    wait: Duration,
+) -> Result<Vec<DiscoveredNode>, ClientError> {
+    discover_nodes(discovery_port, wait, false).await
+}
+
+/// Returns the first offload server that replies within `wait`.
+///
+/// # Errors
+///
+/// Returns [`ClientError::NoNodesDiscovered`] if none replied, or [`ClientError::Io`]
+/// on socket failure.
+pub async fn discover_first(
+    discovery_port: u16,
+    wait: Duration,
+) -> Result<DiscoveredNode, ClientError> {
+    let mut nodes = discover_nodes(discovery_port, wait, true).await?;
+    nodes.pop().ok_or(ClientError::NoNodesDiscovered)
+}
+
+/// Beacons are small JSON objects (~250 bytes); 2 KiB leaves room without fragmenting.
+const BEACON_BUF_BYTES: usize = 2048;
 
 async fn discover_nodes(
     discovery_port: u16,
     wait: Duration,
     stop_on_first: bool,
 ) -> Result<Vec<DiscoveredNode>, ClientError> {
-    let socket = UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))).await?;
+    let socket =
+        UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))).await?;
     socket.set_broadcast(true)?;
 
     let probe_bytes = serde_json::to_vec(&DiscoveryProbe::new()).expect("probe serialize");
@@ -469,7 +620,7 @@ async fn discover_nodes(
     let deadline = Instant::now() + wait;
     let mut seen_urls = HashSet::new();
     let mut nodes = Vec::new();
-    let mut buf = [0_u8; 2048];
+    let mut buf = [0_u8; BEACON_BUF_BYTES];
 
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -507,19 +658,12 @@ async fn discover_nodes(
     Ok(nodes)
 }
 
-async fn read_full_chunk(file: &mut File, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        let n = file.read(&mut buf[filled..]).await?;
-        if n == 0 {
-            break;
-        }
-        filled += n;
-    }
-    Ok(filled)
-}
-
+/// Progress callbacks fire at most this often (10 Hz), enough for a smooth terminal bar.
 const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Weight of the newest sample in the speed EMA. 0.3 smooths Wi-Fi jitter while
+/// still tracking a real speed change within about a second of updates.
+const SPEED_EMA_ALPHA: f64 = 0.3;
 
 struct ProgressTracker {
     total_bytes: u64,
@@ -550,7 +694,12 @@ impl ProgressTracker {
         }
     }
 
-    fn update(&mut self, bytes_delta: u64, bytes_done: u64, force: bool) -> Option<TransferProgress> {
+    fn update(
+        &mut self,
+        bytes_delta: u64,
+        bytes_done: u64,
+        force: bool,
+    ) -> Option<TransferProgress> {
         self.pending_bytes += bytes_delta;
         let elapsed = self.last_report.elapsed();
         if !force && elapsed < PROGRESS_REPORT_INTERVAL {
@@ -561,14 +710,20 @@ impl ProgressTracker {
         self.ema_speed_bps = if self.ema_speed_bps == 0.0 {
             inst_bps
         } else {
-            0.3 * inst_bps + 0.7 * self.ema_speed_bps
+            SPEED_EMA_ALPHA * inst_bps + (1.0 - SPEED_EMA_ALPHA) * self.ema_speed_bps
         };
         self.pending_bytes = 0;
         self.last_report = Instant::now();
 
         let remaining = self.total_bytes.saturating_sub(bytes_done);
         let eta_secs = if self.ema_speed_bps > 1.0 && remaining > 0 {
-            Some((remaining as f64 / self.ema_speed_bps).ceil() as u64)
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "positive finite seconds; `as` saturates on overflow"
+            )]
+            let secs = (remaining as f64 / self.ema_speed_bps).ceil() as u64;
+            Some(secs)
         } else {
             Some(0)
         };
@@ -586,7 +741,7 @@ impl ProgressTracker {
 /// Local-file hash started early so it overlaps network round-trips. Dropping it
 /// (early return, error, or hash not needed) stops the read instead of finishing the file.
 struct BackgroundHash {
-    handle: Option<tokio::task::JoinHandle<std::io::Result<String>>>,
+    handle: Option<tokio::task::JoinHandle<io::Result<String>>>,
     result: Option<String>,
     cancel: Arc<AtomicBool>,
 }
@@ -594,7 +749,7 @@ struct BackgroundHash {
 impl BackgroundHash {
     fn spawn(path: PathBuf) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
-        let flag = cancel.clone();
+        let flag = Arc::clone(&cancel);
         let handle = tokio::task::spawn_blocking(move || {
             offload_protocol::blake3_hex(StopOnFlag(std::fs::File::open(path)?, flag))
         });
@@ -612,8 +767,8 @@ impl BackgroundHash {
         let handle = self
             .handle
             .take()
-            .ok_or_else(|| std::io::Error::other("local hash already failed"))?;
-        let hash = handle.await.map_err(std::io::Error::other)??;
+            .ok_or_else(|| io::Error::other("local hash already failed"))?;
+        let hash = handle.await.map_err(io::Error::other)??;
         self.result = Some(hash.clone());
         Ok(hash)
     }
@@ -629,19 +784,32 @@ impl Drop for BackgroundHash {
 struct StopOnFlag<R>(R, Arc<AtomicBool>);
 
 impl<R: Read> Read for StopOnFlag<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.1.load(Ordering::Relaxed) {
-            return Err(std::io::Error::other("hash cancelled"));
+            return Err(io::Error::other("hash cancelled"));
         }
         self.0.read(buf)
     }
 }
 
-async fn compute_blake3_blocking(path: &Path) -> Result<String, std::io::Error> {
+/// Whether `path` already holds exactly `size` bytes with BLAKE3 digest `blake3`.
+async fn local_matches(path: &Path, size: u64, blake3: Option<&str>) -> io::Result<bool> {
+    let Some(expected) = blake3 else {
+        return Ok(false);
+    };
+    match fs::metadata(path).await {
+        Ok(meta) if meta.len() == size => Ok(compute_blake3_blocking(path).await? == expected),
+        Ok(_) => Ok(false),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+async fn compute_blake3_blocking(path: &Path) -> Result<String, io::Error> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || offload_protocol::blake3_hex(std::fs::File::open(path)?))
         .await
-        .map_err(std::io::Error::other)?
+        .map_err(io::Error::other)?
 }
 
 async fn send_json<T: serde::de::DeserializeOwned>(req: RequestBuilder) -> Result<T, ClientError> {
@@ -656,16 +824,15 @@ async fn send_json<T: serde::de::DeserializeOwned>(req: RequestBuilder) -> Resul
 async fn extract_api_error(res: reqwest::Response) -> ClientError {
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
-    let message = serde_json::from_str::<ErrorResponse>(&body)
-        .map(|e| e.error)
-        .unwrap_or_else(|_| {
-            if body.is_empty() {
-                status.to_string()
-            } else {
-                body
-            }
-        });
-    ClientError::Api { status, message }
+    let message = match serde_json::from_str::<ErrorResponse>(&body) {
+        Ok(e) => e.error,
+        Err(_) if body.is_empty() => status.to_string(),
+        Err(_) => body,
+    };
+    ClientError::Api {
+        status: status.as_u16(),
+        message,
+    }
 }
 
 #[cfg(test)]

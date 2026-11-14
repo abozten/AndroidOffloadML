@@ -1,3 +1,5 @@
+//! UDP responder that answers LAN discovery probes with a [`DiscoveryBeacon`].
+
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use offload_protocol::{DISCOVERY_MULTICAST_ADDR, DiscoveryBeacon, DiscoveryProbe};
@@ -13,8 +15,17 @@ pub struct DiscoveryConfig {
     pub auth_required: bool,
 }
 
-/// Spawn a background UDP responder for LAN discovery probes.
-pub async fn spawn_discovery_responder(cfg: DiscoveryConfig) -> std::io::Result<()> {
+/// Probes are tiny JSON objects (~45 bytes); anything larger is not ours and is ignored.
+const PROBE_BUF_BYTES: usize = 1024;
+
+/// Binds `cfg.port` (0 = ephemeral) and spawns a task answering discovery probes.
+///
+/// Returns the bound UDP port.
+///
+/// # Errors
+///
+/// Returns the I/O error if the UDP socket cannot be bound.
+pub async fn spawn_discovery_responder(cfg: DiscoveryConfig) -> std::io::Result<u16> {
     let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, cfg.port));
     let socket = UdpSocket::bind(bind_addr).await?;
     let _ = socket.set_broadcast(true);
@@ -33,22 +44,21 @@ pub async fn spawn_discovery_responder(cfg: DiscoveryConfig) -> std::io::Result<
         http_port: cfg.http_port,
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        logical_cpus: std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
+        logical_cpus: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
         auth_required: cfg.auth_required,
     };
     let beacon_bytes = serde_json::to_vec(&beacon).expect("beacon serialization cannot fail");
+    let bound_port = socket.local_addr()?.port();
 
     info!(
-        discovery_port = cfg.port,
+        discovery_port = bound_port,
         http_port = cfg.http_port,
         node_name = %beacon.name,
         "LAN discovery responder listening"
     );
 
     tokio::spawn(async move {
-        let mut buf = [0_u8; 1024];
+        let mut buf = [0_u8; PROBE_BUF_BYTES];
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((len, peer)) => {
@@ -66,7 +76,7 @@ pub async fn spawn_discovery_responder(cfg: DiscoveryConfig) -> std::io::Result<
         }
     });
 
-    Ok(())
+    Ok(bound_port)
 }
 
 #[cfg(test)]
@@ -77,52 +87,38 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_responder_replies_to_probe() {
-        let probe_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let probe_port = probe_sock.local_addr().unwrap().port();
-
-        // Bind a responder on an ephemeral port using the same logic.
-        let resp_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let resp_addr = resp_sock.local_addr().unwrap();
-
-        let beacon = DiscoveryBeacon {
-            magic: DiscoveryBeacon::MAGIC.to_string(),
-            service: "offload-server".to_string(),
-            version: "0.1.0".to_string(),
-            name: "test-phone".to_string(),
+        let port = spawn_discovery_responder(DiscoveryConfig {
+            port: 0,
             http_port: 7878,
-            os: "android".to_string(),
-            arch: "aarch64".to_string(),
-            logical_cpus: 8,
-            auth_required: false,
-        };
-        let beacon_bytes = serde_json::to_vec(&beacon).unwrap();
-
-        tokio::spawn(async move {
-            let mut buf = [0_u8; 512];
-            if let Ok((len, peer)) = resp_sock.recv_from(&mut buf).await
-                && let Ok(probe) = serde_json::from_slice::<DiscoveryProbe>(&buf[..len])
-                && probe.magic == DiscoveryProbe::MAGIC
-            {
-                let _ = resp_sock.send_to(&beacon_bytes, peer).await;
-            }
-        });
-
-        let probe_bytes = serde_json::to_vec(&DiscoveryProbe::new()).unwrap();
-        probe_sock.send_to(&probe_bytes, resp_addr).await.unwrap();
-
-        let mut recv_buf = [0_u8; 1024];
-        let (len, from) = tokio::time::timeout(
-            Duration::from_secs(2),
-            probe_sock.recv_from(&mut recv_buf),
-        )
+            node_name: "test-phone".to_string(),
+            auth_required: true,
+        })
         .await
-        .unwrap()
         .unwrap();
 
-        assert_eq!(from.port(), resp_addr.port());
-        assert_ne!(probe_port, 0);
+        let probe_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let probe_bytes = serde_json::to_vec(&DiscoveryProbe::new()).unwrap();
+        // Junk first: the responder must ignore it and keep serving.
+        probe_sock
+            .send_to(b"not json", ("127.0.0.1", port))
+            .await
+            .unwrap();
+        probe_sock
+            .send_to(&probe_bytes, ("127.0.0.1", port))
+            .await
+            .unwrap();
+
+        let mut recv_buf = [0_u8; 1024];
+        let (len, _) =
+            tokio::time::timeout(Duration::from_secs(2), probe_sock.recv_from(&mut recv_buf))
+                .await
+                .expect("responder must reply to a valid probe")
+                .unwrap();
+
         let decoded: DiscoveryBeacon = serde_json::from_slice(&recv_buf[..len]).unwrap();
+        assert_eq!(decoded.magic, DiscoveryBeacon::MAGIC);
         assert_eq!(decoded.name, "test-phone");
         assert_eq!(decoded.http_port, 7878);
+        assert!(decoded.auth_required);
     }
 }

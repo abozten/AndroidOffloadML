@@ -1,12 +1,21 @@
+//! Task execution: in-process compute (`MatMul`, `CosineTopK`) and sandboxed subprocesses.
+
 use std::{
     path::{Component, Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
 
+/// Largest `MatMul` output accepted: 64 Mi f32 = 256 MiB, and several times that as JSON.
+/// Bigger requests would risk the Android low-memory killer taking the whole server down.
 const MAX_MATMUL_OUTPUT_ELEMENTS: usize = 64 * 1024 * 1024;
+
+/// Cap on stdout/stderr kept in a task result (streaming is unaffected). Keeps job
+/// records, which are retained in memory, bounded for chatty processes.
 const MAX_COLLECTED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
+/// llama.cpp flags that take a value and are safe to expose: none of them read or write
+/// files, so they can't be used to escape `--models-dir` or the allowlist.
 const ALLOWED_LLAMA_VALUE_FLAGS: &[&str] = &[
     "-c",
     "--ctx-size",
@@ -46,6 +55,7 @@ const ALLOWED_LLAMA_VALUE_FLAGS: &[&str] = &[
     "--rope-freq-scale",
 ];
 
+/// Value-less llama.cpp flags that are safe to expose (see [`ALLOWED_LLAMA_VALUE_FLAGS`]).
 const ALLOWED_LLAMA_BOOL_FLAGS: &[&str] = &[
     "--no-display-prompt",
     "--simple-io",
@@ -60,7 +70,7 @@ const ALLOWED_LLAMA_BOOL_FLAGS: &[&str] = &[
     "--verbose-prompt",
 ];
 
-use offload_protocol::{JobStreamEvent, SimilarityMatch, TaskKind, TaskResult};
+use offload_protocol::{JobStreamEvent, OutputStream, SimilarityMatch, TaskKind, TaskResult};
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -71,21 +81,34 @@ use tokio::{
 
 use crate::state::ServerConfig;
 
+/// Why a task could not produce a result; mapped to an HTTP status by `ApiError`.
 #[derive(Debug, Error)]
 pub enum RunnerError {
+    /// Malformed task parameters (400).
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// Disallowed command, path, or flag (403).
     #[error("forbidden: {0}")]
     Forbidden(String),
+    /// Subprocess exceeded its timeout, in seconds (504).
     #[error("execution timed out after {0}s")]
     Timeout(u64),
+    /// Subprocess failed to spawn or exited non-zero (502).
     #[error("process execution failed: {0}")]
     Process(String),
+    /// A worker thread panicked or was cancelled (500).
     #[error("internal task failure: {0}")]
     Internal(String),
 }
 
-/// Execute a single ML or compute task using the configured worker environment.
+/// Executes one task with the configured worker environment.
+///
+/// CPU-bound tasks run on the blocking pool; subprocess output is forwarded line by
+/// line to `stream_tx` when given.
+///
+/// # Errors
+///
+/// Returns a [`RunnerError`] describing why the task was rejected or failed.
 pub async fn execute_task(
     task: TaskKind,
     config: &ServerConfig,
@@ -296,6 +319,11 @@ fn l2_norm(v: &[f32]) -> f32 {
     v.iter().map(|x| x * x).sum::<f32>().sqrt()
 }
 
+/// Resolves a model name inside `models_dir`, rejecting absolute paths and `..` when set.
+///
+/// # Errors
+///
+/// [`RunnerError::InvalidInput`] for an empty name, [`RunnerError::Forbidden`] if it escapes `models_dir`.
 pub fn resolve_model_path(model: &str, models_dir: Option<&Path>) -> Result<PathBuf, RunnerError> {
     if model.trim().is_empty() {
         return Err(RunnerError::InvalidInput("model must not be empty".into()));
@@ -310,7 +338,10 @@ pub fn resolve_model_path(model: &str, models_dir: Option<&Path>) -> Result<Path
                 ));
             }
             for comp in rel.components() {
-                if matches!(comp, Component::ParentDir | Component::RootDir | Component::Prefix(_)) {
+                if matches!(
+                    comp,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                ) {
                     return Err(RunnerError::Forbidden(
                         "model path must stay within --models-dir".into(),
                     ));
@@ -322,6 +353,12 @@ pub fn resolve_model_path(model: &str, models_dir: Option<&Path>) -> Result<Path
     }
 }
 
+/// Checks every extra llama.cpp argument against the flag allowlists.
+///
+/// # Errors
+///
+/// [`RunnerError::Forbidden`] for unknown flags, positional args, or path-like values;
+/// [`RunnerError::InvalidInput`] if a value flag is missing its value.
 pub fn validate_llama_extra_args(extra_args: &[String]) -> Result<(), RunnerError> {
     let mut i = 0;
     while i < extra_args.len() {
@@ -336,14 +373,13 @@ pub fn validate_llama_extra_args(extra_args: &[String]) -> Result<(), RunnerErro
             None => (arg.as_str(), None),
         };
         if ALLOWED_LLAMA_VALUE_FLAGS.contains(&flag) {
-            let val = match inline_val {
-                Some(v) => v,
-                None => {
-                    i += 1;
-                    extra_args.get(i).map(String::as_str).ok_or_else(|| {
-                        RunnerError::InvalidInput(format!("llama extra arg '{flag}' requires a value"))
-                    })?
-                }
+            let val = if let Some(v) = inline_val {
+                v
+            } else {
+                i += 1;
+                extra_args.get(i).map(String::as_str).ok_or_else(|| {
+                    RunnerError::InvalidInput(format!("llama extra arg '{flag}' requires a value"))
+                })?
             };
             if val.is_empty() || val.contains('/') || val.contains('\\') || val.contains("..") {
                 return Err(RunnerError::Forbidden(format!(
@@ -362,6 +398,7 @@ pub fn validate_llama_extra_args(extra_args: &[String]) -> Result<(), RunnerErro
     Ok(())
 }
 
+/// Whether `program` exactly matches an `--allow-cmd` entry (no path or prefix matching).
 pub fn is_command_allowed(program: &str, allowed_commands: &[String]) -> bool {
     if program.trim().is_empty() {
         return false;
@@ -404,12 +441,20 @@ async fn run_subprocess(
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
 
-    let out_task = tokio::spawn(read_pipe_lines(stdout_pipe, "stdout", stream_tx.clone()));
-    let err_task = tokio::spawn(read_pipe_lines(stderr_pipe, "stderr", stream_tx));
+    let out_task = tokio::spawn(read_pipe_lines(
+        stdout_pipe,
+        OutputStream::Stdout,
+        stream_tx.clone(),
+    ));
+    let err_task = tokio::spawn(read_pipe_lines(
+        stderr_pipe,
+        OutputStream::Stderr,
+        stream_tx,
+    ));
 
     let status = timeout(limit, child.wait())
         .await
-        .map_err(|_| RunnerError::Timeout(limit.as_secs()))?
+        .map_err(|_elapsed| RunnerError::Timeout(limit.as_secs()))?
         .map_err(|e| RunnerError::Process(format!("failed waiting on '{program}': {e}")))?;
 
     let stdout = out_task.await.unwrap_or_default();
@@ -437,7 +482,7 @@ async fn run_subprocess(
 
 async fn read_pipe_lines<R>(
     pipe: Option<R>,
-    stream_name: &'static str,
+    stream: OutputStream,
     tx: Option<broadcast::Sender<JobStreamEvent>>,
 ) -> String
 where
@@ -469,7 +514,7 @@ where
         let line = String::from_utf8_lossy(&raw_line).into_owned();
         if let Some(tx) = &tx {
             let _ = tx.send(JobStreamEvent::Output {
-                stream: stream_name.to_string(),
+                stream,
                 line: line.clone(),
             });
         }
@@ -482,7 +527,8 @@ where
                 }
                 collected.push_str(&line);
             } else {
-                let remaining = MAX_COLLECTED_OUTPUT_BYTES.saturating_sub(collected.len() + sep_len);
+                let remaining =
+                    MAX_COLLECTED_OUTPUT_BYTES.saturating_sub(collected.len() + sep_len);
                 if remaining > 0 {
                     if sep_len > 0 {
                         collected.push('\n');
@@ -540,8 +586,8 @@ mod tests {
     #[test]
     fn model_path_rejects_traversal_when_models_dir_set() {
         let base = Path::new("/data/data/com.termux/files/home/models");
-        assert!(resolve_model_path("../secret.gguf", Some(base)).is_err());
-        assert!(resolve_model_path("/etc/passwd", Some(base)).is_err());
+        resolve_model_path("../secret.gguf", Some(base)).unwrap_err();
+        resolve_model_path("/etc/passwd", Some(base)).unwrap_err();
         assert_eq!(
             resolve_model_path("qwen2.5-3b.gguf", Some(base)).unwrap(),
             base.join("qwen2.5-3b.gguf")
@@ -577,26 +623,27 @@ mod tests {
 
     #[test]
     fn validate_llama_extra_args_blocks_paths_and_model_flags() {
-        assert!(
-            validate_llama_extra_args(&[
-                "--temp".into(),
-                "0.7".into(),
-                "--ctx-size=4096".into(),
-                "--simple-io".into(),
-            ])
-            .is_ok()
-        );
-        assert!(validate_llama_extra_args(&["-m".into(), "/etc/passwd".into()]).is_err());
-        assert!(validate_llama_extra_args(&["--model=/etc/passwd".into()]).is_err());
-        assert!(validate_llama_extra_args(&["--log-file".into(), "/tmp/out".into()]).is_err());
-        assert!(validate_llama_extra_args(&["/etc/passwd".into()]).is_err());
-        assert!(validate_llama_extra_args(&["--ctx-size".into(), "../foo".into()]).is_err());
+        validate_llama_extra_args(&[
+            "--temp".into(),
+            "0.7".into(),
+            "--ctx-size=4096".into(),
+            "--simple-io".into(),
+        ])
+        .unwrap();
+        validate_llama_extra_args(&["-m".into(), "/etc/passwd".into()]).unwrap_err();
+        validate_llama_extra_args(&["--model=/etc/passwd".into()]).unwrap_err();
+        validate_llama_extra_args(&["--log-file".into(), "/tmp/out".into()]).unwrap_err();
+        validate_llama_extra_args(&["/etc/passwd".into()]).unwrap_err();
+        validate_llama_extra_args(&["--ctx-size".into(), "../foo".into()]).unwrap_err();
     }
 
     #[tokio::test]
     async fn read_pipe_lines_handles_non_utf8_bytes() {
         let data: &[u8] = b"first line\nhello \xff\xfe world\nthird line\n";
-        let output = read_pipe_lines(Some(data), "stdout", None).await;
-        assert_eq!(output, "first line\nhello \u{FFFD}\u{FFFD} world\nthird line");
+        let output = read_pipe_lines(Some(data), OutputStream::Stdout, None).await;
+        assert_eq!(
+            output,
+            "first line\nhello \u{FFFD}\u{FFFD} world\nthird line"
+        );
     }
 }

@@ -1,3 +1,8 @@
+//! Resumable file transfer under `--files-dir`: status, chunked upload, Range download.
+//!
+//! Uploads stage into `<path>.part` and are renamed into place when the last chunk
+//! lands; completed files are BLAKE3-hashed (cached by file identity) for verification.
+
 use std::{
     io::{Seek, SeekFrom},
     path::{Component, Path, PathBuf},
@@ -14,12 +19,14 @@ use offload_protocol::{ChunkUploadResponse, FileTransferStatus};
 use serde::Deserialize;
 use tokio::{
     fs::{self, File, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::mpsc,
+    io::{AsyncSeekExt, AsyncWriteExt},
 };
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::io::ReaderStream;
 
-use crate::{ApiError, state::AppState};
+use crate::{error::ApiError, state::AppState};
+
+/// Download read size. 256 KiB keeps syscalls per GB low without large per-request buffers.
+const DOWNLOAD_BUF_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct FileStatusQuery {
@@ -91,13 +98,12 @@ fn part_path(final_path: &Path) -> PathBuf {
 /// renamed over concurrently.
 async fn hash_handle(file: File) -> Result<String, ApiError> {
     let mut file = file.into_std().await;
-    tokio::task::spawn_blocking(move || {
+    let hash = tokio::task::spawn_blocking(move || {
         file.rewind()?;
         offload_protocol::blake3_hex(&file)
     })
-    .await
-    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    .await??;
+    Ok(hash)
 }
 
 pub async fn file_status(
@@ -110,17 +116,15 @@ pub async fn file_status(
     let part_meta = fs::metadata(&staging_path).await.ok();
     let (final_size, blake3) = match File::open(&final_path).await {
         Ok(file) => {
-            let meta = file
-                .metadata()
-                .await
-                .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            let hash = match state.get_file_hash(&final_path, &meta).await {
-                Some(cached) => cached,
-                None => {
-                    let hash = hash_handle(file).await?;
-                    state.insert_file_hash(final_path, &meta, hash.clone()).await;
-                    hash
-                }
+            let meta = file.metadata().await?;
+            let hash = if let Some(cached) = state.get_file_hash(&final_path, &meta).await {
+                cached
+            } else {
+                let hash = hash_handle(file).await?;
+                state
+                    .insert_file_hash(final_path, &meta, hash.clone())
+                    .await;
+                hash
             };
             (Some(meta.len()), Some(hash))
         }
@@ -132,7 +136,7 @@ pub async fn file_status(
         exists: final_size.is_some(),
         final_size,
         blake3,
-        partial_size: part_meta.map(|m| m.len()).unwrap_or(0),
+        partial_size: part_meta.map_or(0, |m| m.len()),
     }))
 }
 
@@ -143,9 +147,7 @@ pub async fn upload_chunk(
 ) -> Result<Json<ChunkUploadResponse>, ApiError> {
     let final_path = resolve_upload_path(&q.path, &state.config.files_dir)?;
     if let Some(parent) = final_path.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        fs::create_dir_all(parent).await?;
     }
 
     let staging_path = part_path(&final_path);
@@ -177,39 +179,28 @@ pub async fn upload_chunk(
 
     let mut file = OpenOptions::new()
         .create(true)
+        .truncate(false) // existing bytes are the resume point
         .write(true)
         .read(true)
         .open(&staging_path)
-        .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .await?;
 
-    file.seek(SeekFrom::Start(q.offset))
-        .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    file.write_all(&body)
-        .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    file.seek(SeekFrom::Start(q.offset)).await?;
+    file.write_all(&body).await?;
 
-    file.set_len(new_end)
-        .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    file.flush()
-        .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    file.set_len(new_end).await?;
+    file.flush().await?;
 
     let completed = new_end == q.total_size;
     let blake3 = if completed {
-        fs::rename(&staging_path, &final_path)
-            .await
-            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        fs::rename(&staging_path, &final_path).await?;
         // Stat and hash our own handle (post-rename, so ctime is final), never the path:
         // another upload may already have renamed its file over `final_path`.
-        let meta = file
-            .metadata()
-            .await
-            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let meta = file.metadata().await?;
         let hash = hash_handle(file).await?;
-        state.insert_file_hash(final_path, &meta, hash.clone()).await;
+        state
+            .insert_file_hash(final_path, &meta, hash.clone())
+            .await;
         Some(hash)
     } else {
         None
@@ -229,53 +220,31 @@ pub async fn download_file(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let final_path = resolve_upload_path(&q.path, &state.config.files_dir)?;
-    let meta = fs::metadata(&final_path)
-        .await
-        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, format!("file '{}' not found", q.path)))?;
+    let meta = fs::metadata(&final_path).await.map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            ApiError::not_found(format!("file '{}' not found", q.path))
+        } else {
+            err.into()
+        }
+    })?;
     let total_size = meta.len();
 
     let start = parse_range_start(&headers, total_size)?;
-    let mut file = File::open(&final_path)
-        .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    file.seek(SeekFrom::Start(start))
-        .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut file = File::open(&final_path).await?;
+    file.seek(SeekFrom::Start(start)).await?;
 
     let remaining = total_size.saturating_sub(start);
-    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
-
-    tokio::spawn(async move {
-        let mut buf = vec![0_u8; 256 * 1024];
-        loop {
-            match file.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if tx.send(Ok(Bytes::copy_from_slice(&buf[..n]))).await.is_err() {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    let _ = tx.send(Err(err)).await;
-                    break;
-                }
-            }
-        }
-    });
-
-    let body = Body::from_stream(ReceiverStream::new(rx));
+    let body = Body::from_stream(ReaderStream::with_capacity(file, DOWNLOAD_BUF_BYTES));
     let mut builder = Response::builder()
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, remaining.to_string())
         .header(header::CONTENT_TYPE, "application/octet-stream");
 
     if start > 0 && total_size > 0 {
-        builder = builder
-            .status(StatusCode::PARTIAL_CONTENT)
-            .header(
-                header::CONTENT_RANGE,
-                format!("bytes {start}-{}/{total_size}", total_size - 1),
-            );
+        builder = builder.status(StatusCode::PARTIAL_CONTENT).header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{}/{total_size}", total_size - 1),
+        );
     } else {
         builder = builder.status(StatusCode::OK);
     }
@@ -296,8 +265,11 @@ fn parse_range_start(headers: &HeaderMap, total_size: u64) -> Result<u64, ApiErr
         ));
     };
     let start_str = spec.split('-').next().unwrap_or("");
-    let start: u64 = start_str.parse().map_err(|_| {
-        ApiError::new(StatusCode::RANGE_NOT_SATISFIABLE, "invalid Range start")
+    let start: u64 = start_str.parse().map_err(|e| {
+        ApiError::new(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            format!("invalid Range start: {e}"),
+        )
     })?;
     if total_size > 0 && start >= total_size {
         return Err(ApiError::new(
@@ -315,8 +287,8 @@ mod tests {
     #[test]
     fn upload_path_blocks_traversal() {
         let base = Path::new("/tmp/offload-files");
-        assert!(resolve_upload_path("../evil.bin", base).is_err());
-        assert!(resolve_upload_path("/etc/passwd", base).is_err());
+        resolve_upload_path("../evil.bin", base).unwrap_err();
+        resolve_upload_path("/etc/passwd", base).unwrap_err();
         assert_eq!(
             resolve_upload_path("models/qwen.gguf", base).unwrap(),
             base.join("models/qwen.gguf")

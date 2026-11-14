@@ -1,3 +1,5 @@
+//! Best-effort Linux/Android system telemetry for `/v1/info`.
+
 use std::fs;
 
 /// Memory and thermal telemetry read from `/proc/meminfo` and `/sys/class/thermal`.
@@ -8,6 +10,7 @@ pub struct SystemTelemetry {
     pub thermal_c: Option<f32>,
 }
 
+/// Reads current telemetry; any source that is missing or unreadable is left `None`.
 pub fn read_telemetry() -> SystemTelemetry {
     let (mem_total_mb, mem_available_mb) = fs::read_to_string("/proc/meminfo")
         .map(|s| parse_meminfo(&s))
@@ -22,6 +25,7 @@ pub fn read_telemetry() -> SystemTelemetry {
     }
 }
 
+/// Extracts `(MemTotal, MemAvailable)` in MiB from `/proc/meminfo` contents.
 pub fn parse_meminfo(contents: &str) -> (Option<u64>, Option<u64>) {
     let mut total_kb = None;
     let mut avail_kb = None;
@@ -55,7 +59,8 @@ fn read_max_thermal_c() -> Option<f32> {
         let Ok(milli_c) = raw.trim().parse::<i64>() else {
             continue;
         };
-        // Ignore bogus/disconnected sensors.
+        // Ignore bogus/disconnected sensors: they report negatives or values like 255 °C;
+        // nothing on a working phone exceeds 150 °C (150_000 millidegrees).
         if !(0..=150_000).contains(&milli_c) {
             continue;
         }
