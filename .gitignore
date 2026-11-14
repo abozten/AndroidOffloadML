@@ -1,6 +1,12 @@
-/.agents
-/.cargo
-/Cargo.lock
-/Cargo.toml
-/README.md
-/target
+# Cargo build output (debug/, release/, cross-compile targets, flycheck)
+/target/
+
+# Cargo.lock is intentionally NOT ignored: this workspace ships binaries
+# (offload-server, offload-client, offload-mcp), and Rust convention is to
+# commit the lockfile for applications.
+
+# rustfmt backup files
+**/*.rs.bk
+
+# MSVC debug symbols
+*.pdb
