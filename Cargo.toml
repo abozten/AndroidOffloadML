@@ -12,7 +12,7 @@ version = "0.1.0"
 edition = "2024"
 # let-chains (`if let .. && let ..`) are used throughout and stabilized in 1.88.
 rust-version = "1.88"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 offload-protocol = { path = "crates/protocol" }

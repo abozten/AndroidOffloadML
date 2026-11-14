@@ -5,7 +5,7 @@
 **Turn your Android phone into a tiny compute node.**
 Offload ML inference and compute jobs from your laptop to **Termux** — over your LAN, with one static binary.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)
 ![Target](https://img.shields.io/badge/target-aarch64--musl-informational?logo=android)
 ![Binary](https://img.shields.io/badge/server-~5.5%20MB-success)
@@ -168,4 +168,4 @@ Exposes `discover_nodes`, `node_info`, `run_llama`, `run_command`, `run_task`, a
 
 ## 📄 License
 
-[MIT](LICENSE)
+[GPL-3.0-or-later](LICENSE)
