@@ -1,6 +1,6 @@
 <div align="center">
 
-# 📱 AndroidOffload
+# AndroidOffload
 
 **Turn your Android phone into a tiny compute node.**
 Offload ML inference and compute jobs from your laptop to **Termux** — over your LAN, with one static binary.
@@ -14,29 +14,29 @@ Offload ML inference and compute jobs from your laptop to **Termux** — over yo
 
 ---
 
-## ✨ Features
+## Features
 
 | | |
 |---|---|
-| 🔍 **Zero-config discovery** | UDP broadcast + multicast on port `7879` — no phone IP to look up |
-| 🦙 **llama.cpp inference** | Run GGUF models from `--models-dir` (path-traversal protected) |
-| 🧮 **Built-in tasks** | `echo`, `mat_mul`, `cosine_top_k` on `spawn_blocking` |
-| 🛠️ **Allowlisted commands** | Run `python3`, `whisper-cli`, etc. — only what you permit via `--allow-cmd` |
-| 📦 **Resumable uploads** | Push multi-GB models with BLAKE3 integrity checks, resume, and a speed/ETA bar |
-| ⚡ **Sync & async jobs** | `/v1/run` for quick calls, `/v1/jobs` for long-running work |
-| 🔐 **Bearer-token auth** | Plus `--max-concurrent` to keep your phone from melting |
-| 🤖 **Agent-ready** | Ships an MCP stdio server and a workspace skill |
+| **Zero-config discovery** | UDP broadcast + multicast on port `7879` — no phone IP to look up |
+| **llama.cpp inference** | Run GGUF models from `--models-dir` (path-traversal protected) |
+| **Built-in tasks** | `echo`, `mat_mul`, `cosine_top_k` on `spawn_blocking` |
+| **Allowlisted commands** | Run `python3`, `whisper-cli`, etc. — only what you permit via `--allow-cmd` |
+| **Resumable uploads** | Push multi-GB models with BLAKE3 integrity checks, resume, and a speed/ETA bar |
+| **Sync & async jobs** | `/v1/run` for quick calls, `/v1/jobs` for long-running work |
+| **Bearer-token auth** | Plus `--max-concurrent` to keep your phone from melting |
+| **Agent-ready** | Ships an MCP stdio server and a workspace skill |
 
-## 🏗️ Architecture
+## Architecture
 
 ```mermaid
 flowchart LR
-    subgraph Host["💻 Mac / Linux / Windows"]
+    subgraph Host["Mac / Linux / Windows"]
         CLI[offload-client<br/>CLI + library]
         MCP[offload-mcp<br/>MCP stdio server]
         Agent([AI agent]) --> MCP
     end
-    subgraph Phone["📱 Android · Termux"]
+    subgraph Phone["Android · Termux"]
         SRV[offload-server<br/>Axum HTTP]
         SRV --> T[Built-in tasks]
         SRV --> L[llama-cli]
@@ -54,7 +54,7 @@ flowchart LR
 | [`offload-client`](crates/client/src/main.rs) | Rust client library + CLI for your host |
 | [`offload-mcp`](crates/mcp/src/main.rs) | MCP stdio server exposing the node as agent tools |
 
-## 🚀 Quick start
+## Quick start
 
 ### 1. Cross-compile the server
 
@@ -95,7 +95,7 @@ chmod +x offload-server
   --allow-cmd python3,whisper-cli
 ```
 
-> 💡 Run `termux-wake-lock` before long jobs so Android doesn't throttle or sleep the process.
+> Run `termux-wake-lock` before long jobs so Android doesn't throttle or sleep the process.
 
 ### 3. Use it from your host
 
@@ -137,7 +137,7 @@ cargo run -p offload-client -- llama \
 cargo run -p offload-client -- cmd --program python3 -- ~/scripts/run_onnx.py --input data.json
 ```
 
-## 🤖 Use with AI agents (MCP)
+## Use with AI agents (MCP)
 
 ```bash
 cargo build --release -p offload-mcp
@@ -160,12 +160,12 @@ Add to your agent's MCP config:
 
 Exposes `discover_nodes`, `node_info`, `run_llama`, `run_command`, `run_task`, and `get_job` as agent tools. A workspace skill lives at [`.agents/skills/android-offload/SKILL.md`](.agents/skills/android-offload/SKILL.md).
 
-## 🔒 Security
+## Security
 
 - Set `--token` whenever the server is reachable by anyone but you; it is plain HTTP, so keep it on a trusted LAN or tunnel it.
 - Commands are deny-by-default: only programs in `--allow-cmd` can run.
 - Model paths are confined to `--models-dir`.
 
-## 📄 License
+## License
 
 [GPL-3.0-or-later](LICENSE)
