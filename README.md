@@ -1,40 +1,91 @@
-# AndroidOffload
+<div align="center">
 
-A lightweight Rust server/client workspace for offloading ML and compute tasks from your host machine to **Termux** on Android (e.g., OnePlus 15).
+# 📱 AndroidOffload
 
-## Architecture
+**Turn your Android phone into a tiny compute node.**
+Offload ML inference and compute jobs from your laptop to **Termux** — over your LAN, with one static binary.
 
-- [`crates/protocol`](crates/protocol/src/lib.rs) (`offload-protocol`): Shared JSON/HTTP wire types (`TaskKind`, `TaskResult`, `JobRecord`, `NodeInfo`).
-- [`crates/server`](crates/server/src/main.rs) (`offload-server`): Async Axum HTTP server intended to run inside Termux on Android. Features:
-  - Built-in compute tasks (`echo`, `mat_mul`, `cosine_top_k`) executed on `spawn_blocking`.
-  - `llama_completion` task to run `llama.cpp` (`llama-cli`) against models in `--models-dir` (with path-traversal protection).
-  - `command` task to run allowlisted ML binaries/scripts (`--allow-cmd python3,whisper-cli`).
-  - Concurrency limiting (`--max-concurrent`), optional Bearer token auth (`--token`), and both sync (`/v1/run`) and async (`/v1/jobs`) endpoints.
-- [`crates/client`](crates/client/src/main.rs) (`offload-client`): Async Rust client library and CLI for your Mac/Linux/Windows host.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Rust](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)
+![Target](https://img.shields.io/badge/target-aarch64--musl-informational?logo=android)
+![Binary](https://img.shields.io/badge/server-~5.5%20MB-success)
 
-## 1. Cross-compile `offload-server` on your Mac
+</div>
 
-Build a single static ARM64 binary (configured in `.cargo/config.toml` via `rust-lld`):
+---
+
+## ✨ Features
+
+| | |
+|---|---|
+| 🔍 **Zero-config discovery** | UDP broadcast + multicast on port `7879` — no phone IP to look up |
+| 🦙 **llama.cpp inference** | Run GGUF models from `--models-dir` (path-traversal protected) |
+| 🧮 **Built-in tasks** | `echo`, `mat_mul`, `cosine_top_k` on `spawn_blocking` |
+| 🛠️ **Allowlisted commands** | Run `python3`, `whisper-cli`, etc. — only what you permit via `--allow-cmd` |
+| 📦 **Resumable uploads** | Push multi-GB models with BLAKE3 integrity checks, resume, and a speed/ETA bar |
+| ⚡ **Sync & async jobs** | `/v1/run` for quick calls, `/v1/jobs` for long-running work |
+| 🔐 **Bearer-token auth** | Plus `--max-concurrent` to keep your phone from melting |
+| 🤖 **Agent-ready** | Ships an MCP stdio server and a workspace skill |
+
+## 🏗️ Architecture
+
+```mermaid
+flowchart LR
+    subgraph Host["💻 Mac / Linux / Windows"]
+        CLI[offload-client<br/>CLI + library]
+        MCP[offload-mcp<br/>MCP stdio server]
+        Agent([AI agent]) --> MCP
+    end
+    subgraph Phone["📱 Android · Termux"]
+        SRV[offload-server<br/>Axum HTTP]
+        SRV --> T[Built-in tasks]
+        SRV --> L[llama-cli]
+        SRV --> C[Allowlisted commands]
+    end
+    CLI -- "HTTP :7878" --> SRV
+    MCP -- "HTTP :7878" --> SRV
+    CLI -. "UDP :7879 discovery" .-> SRV
+```
+
+| Crate | Role |
+|---|---|
+| [`offload-protocol`](crates/protocol/src/lib.rs) | Shared JSON/HTTP wire types (`TaskKind`, `TaskResult`, `JobRecord`, `NodeInfo`) |
+| [`offload-server`](crates/server/src/main.rs) | Async Axum server that runs inside Termux |
+| [`offload-client`](crates/client/src/main.rs) | Rust client library + CLI for your host |
+| [`offload-mcp`](crates/mcp/src/main.rs) | MCP stdio server exposing the node as agent tools |
+
+## 🚀 Quick start
+
+### 1. Cross-compile the server
 
 ```bash
 rustup target add aarch64-unknown-linux-musl
 cargo build --release -p offload-server --target aarch64-unknown-linux-musl
 ```
 
-This produces a ~5.5 MB statically linked `aarch64` binary at `target/aarch64-unknown-linux-musl/release/offload-server`.
+Produces a ~5.5 MB static `aarch64` binary at `target/aarch64-unknown-linux-musl/release/offload-server`.
 
-The build targets `cortex-a76` (any flagship phone since 2019); remove `target-cpu` from `.cargo/config.toml` for older devices. If you have an aarch64 musl C toolchain (`brew install filosottile/musl-cross/musl-cross`), add `--features mimalloc` for a faster allocator than musl's.
+<details>
+<summary>Build notes</summary>
 
-## 2. Copy & run on Termux over LAN (no ADB or Rust needed on phone)
+- Linking uses `rust-lld` (see [`.cargo/config.toml`](.cargo/config.toml)).
+- The build targets `cortex-a76` (any flagship phone since 2019); remove `target-cpu` for older devices.
+- With an aarch64 musl C toolchain (`brew install filosottile/musl-cross/musl-cross`), add `--features mimalloc` for a faster allocator.
 
-On your **Mac**, serve the binary over LAN for a few seconds:
+</details>
+
+### 2. Copy it to Termux over LAN (no ADB, no Rust on the phone)
+
+On your computer:
+
 ```bash
 python3 -m http.server 8000 --directory target/aarch64-unknown-linux-musl/release
 ```
 
-In **Termux** on your OnePlus 15, download it from your Mac's LAN IP and start the server:
+In Termux:
+
 ```bash
-curl -O http://<mac-lan-ip>:8000/offload-server
+curl -O http://<host-lan-ip>:8000/offload-server
 chmod +x offload-server
 ./offload-server \
   --bind 0.0.0.0:7878 \
@@ -43,61 +94,62 @@ chmod +x offload-server
   --models-dir ~/models \
   --allow-cmd python3,whisper-cli
 ```
-*(You can stop the `python3 -m http.server` on your Mac once `curl` finishes. If you already run `sshd` in Termux, `scp` works too.)*
 
-> Tip: In Termux, run `termux-wake-lock` before starting long ML jobs so Android does not throttle or sleep the process.
+> 💡 Run `termux-wake-lock` before long jobs so Android doesn't throttle or sleep the process.
 
-## 3. Run `offload-client` from your Mac over LAN (auto-discovery)
-
-`offload-server` listens for UDP discovery probes on port `7879` (broadcast + multicast), so you don't even need to look up your phone's IP:
+### 3. Use it from your host
 
 ```bash
-# List all discovered devices on the LAN
-cargo run -p offload-client -- discover
-
-# Or omit --url / OFFLOAD_URL to auto-discover the first node:
 export OFFLOAD_TOKEN="your-secret-token"
-cargo run -p offload-client -- info
+
+cargo run -p offload-client -- discover          # list nodes on the LAN
+cargo run -p offload-client -- info              # auto-discovers the first node
 ```
 
-*(You can still pass `--url http://<phone-lan-ip>:7878` or set `OFFLOAD_URL` to target a specific node directly.)*
+Pass `--url http://<phone-ip>:7878` (or set `OFFLOAD_URL`) to skip discovery.
 
-# Push a large model or file with automatic resume & speed/ETA bar:
-cargo run -p offload-client -- push ./qwen2.5-3b-instruct-q4_k_m.gguf
+**Push a model** (resumes automatically, shows speed + ETA):
 
-# Run an echo latency test or matrix-multiply benchmark:
 ```bash
-cargo run -p offload-client -- echo "hello oneplus 15"
+cargo run -p offload-client -- push ./qwen2.5-3b-instruct-q4_k_m.gguf
+```
+
+**Benchmarks:**
+
+```bash
+cargo run -p offload-client -- echo "hello from my laptop"
 cargo run -p offload-client -- matmul-bench --size 512
 ```
 
-Run `llama.cpp` inference on the phone (sync or async):
+**LLM inference** (sync, or `--async` for a job):
+
 ```bash
 cargo run -p offload-client -- llama \
   --model qwen2.5-3b-instruct-q4_k_m.gguf \
-  --prompt "Summarize why on-device NPU/CPU offload is useful." \
+  --prompt "Summarize why on-device offload is useful." \
   --max-tokens 256 \
   --async
 ```
 
-Run an allowlisted Python ML script on the phone:
+**Allowlisted scripts:**
+
 ```bash
 cargo run -p offload-client -- cmd --program python3 -- ~/scripts/run_onnx.py --input data.json
 ```
 
-## 4. Use with AI Agents (MCP + Skill)
+## 🤖 Use with AI agents (MCP)
 
-Build the MCP stdio server once on your Mac:
 ```bash
 cargo build --release -p offload-mcp
 ```
 
-Add it to your agent's MCP config (e.g. `mcp_config.json`):
+Add to your agent's MCP config:
+
 ```json
 {
   "mcpServers": {
     "android-offload": {
-      "command": "/Users/abozten/Documents/Projects/AndroidOffload/target/release/offload-mcp",
+      "command": "/absolute/path/to/target/release/offload-mcp",
       "env": {
         "OFFLOAD_TOKEN": "your-secret-token"
       }
@@ -106,6 +158,14 @@ Add it to your agent's MCP config (e.g. `mcp_config.json`):
 }
 ```
 
-This exposes `discover_nodes`, `node_info`, `run_llama`, `run_command`, `run_task`, and `get_job` directly as agent tools. A workspace skill is also included at `.agents/skills/android-offload/SKILL.md`.
+Exposes `discover_nodes`, `node_info`, `run_llama`, `run_command`, `run_task`, and `get_job` as agent tools. A workspace skill lives at [`.agents/skills/android-offload/SKILL.md`](.agents/skills/android-offload/SKILL.md).
 
-If using `--token` on the server, pass `--token "your-secret-token"` (or set `OFFLOAD_TOKEN`) and `--url http://<phone-ip>:7878` (or set `OFFLOAD_URL`).
+## 🔒 Security
+
+- Set `--token` whenever the server is reachable by anyone but you; it is plain HTTP, so keep it on a trusted LAN or tunnel it.
+- Commands are deny-by-default: only programs in `--allow-cmd` can run.
+- Model paths are confined to `--models-dir`.
+
+## 📄 License
+
+[MIT](LICENSE)

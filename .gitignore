@@ -10,3 +10,4 @@
 
 # MSVC debug symbols
 *.pdb
+rustguide.md
