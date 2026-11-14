@@ -16,6 +16,10 @@ If the `android-offload` MCP server is connected, call its tools directly:
 4. `run_command` — run an allowlisted command (`python3`, `whisper-cli`, etc.).
 5. `run_task` — run a raw `TaskKind` JSON payload (`echo`, `mat_mul`, `cosine_top_k`, `llama_completion`, `command`).
 
+## Python Client (`python/android_offload.py`)
+
+Zero-dependency Python client for offloading jobs (`OffloadClient.run_command`, `run_task`, `cosine_top_k`, `mat_mul`).
+
 ## CLI Fallback (`offload-client`)
 
 If MCP is not configured, use `offload-client` (auto-discovers on LAN when `--url` / `OFFLOAD_URL` is omitted; pass `OFFLOAD_TOKEN` if the server requires auth):
@@ -25,4 +29,5 @@ cargo run -q -p offload-client -- discover
 cargo run -q -p offload-client -- info
 cargo run -q -p offload-client -- llama --model <model.gguf> --prompt "<prompt>" --async
 cargo run -q -p offload-client -- cmd --program python3 -- <script.py> <args...>
+cargo run -q -p offload-client -- run-json task.json
 ```

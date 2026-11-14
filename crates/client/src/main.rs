@@ -130,6 +130,17 @@ enum Commands {
         #[arg(long)]
         to: Option<PathBuf>,
     },
+
+    /// Execute a raw `TaskKind` JSON payload from a file or stdin (`-`)
+    RunJson {
+        /// Path to a JSON file, or `-` to read from stdin
+        #[arg(default_value = "-")]
+        input: String,
+        #[arg(long)]
+        r#async: bool,
+        #[arg(long)]
+        stream: bool,
+    },
 }
 
 #[tokio::main]
@@ -240,9 +251,27 @@ async fn run() -> CliResult {
 
         Commands::Push { file, to, chunk_mb } => push(&client, &file, to, chunk_mb).await?,
         Commands::Pull { remote_path, to } => pull(&client, &remote_path, to).await?,
+        Commands::RunJson {
+            input,
+            r#async,
+            stream,
+        } => run_json(&client, &input, r#async, stream).await?,
     }
 
     Ok(())
+}
+
+async fn run_json(client: &OffloadClient, input: &str, r#async: bool, stream: bool) -> CliResult {
+    let raw = if input == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    } else {
+        std::fs::read_to_string(input)?
+    };
+    let task: TaskKind = serde_json::from_str(&raw)?;
+    execute_cli_task(client, task, r#async, stream).await
 }
 
 async fn matmul_bench(client: &OffloadClient, size: usize) -> CliResult {

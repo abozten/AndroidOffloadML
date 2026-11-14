@@ -28,12 +28,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use if_addrs::IfAddr;
 use offload_protocol::{
     ChunkUploadResponse, DISCOVERY_MULTICAST_ADDR, DiscoveredNode, DiscoveryBeacon, DiscoveryProbe,
     ErrorResponse, FileTransferStatus, JobRecord, JobStatus, JobStreamEvent, ModelEntry, NodeInfo,
     RunTaskRequest, RunTaskResponse, TaskKind,
 };
 use reqwest::{Client, RequestBuilder, StatusCode, header};
+use socket2::SockRef;
 use thiserror::Error;
 use tokio::{
     fs::{self, File, OpenOptions},
@@ -284,9 +286,10 @@ impl OffloadClient {
     ///
     /// Returns [`ClientError::Transport`] on network failure or [`ClientError::Api`] on non-2xx.
     pub async fn file_status(&self, remote_path: &str) -> Result<FileTransferStatus, ClientError> {
+        let remote_path = normalize_remote_path(remote_path);
         let req = self
             .auth(self.http.get(format!("{}/v1/files/status", self.base_url)))
-            .query(&[("path", remote_path)]);
+            .query(&[("path", remote_path.as_str())]);
         send_json(req).await
     }
 
@@ -310,19 +313,20 @@ impl OffloadClient {
     where
         F: FnMut(TransferProgress),
     {
+        let remote_path = normalize_remote_path(remote_path);
         let mut file = File::open(local_path).await?;
         let total_bytes = file.metadata().await?.len();
         let started = Instant::now();
         let mut local_hash = BackgroundHash::spawn(local_path.to_path_buf());
 
-        let status = self.file_status(remote_path).await?;
+        let status = self.file_status(&remote_path).await?;
         if status.exists
             && status.final_size == Some(total_bytes)
             && let Some(remote_hash) = status.blake3.as_deref()
             && remote_hash == local_hash.get().await?
         {
             return Ok(TransferSummary {
-                remote_path: remote_path.to_string(),
+                remote_path,
                 total_bytes,
                 resumed_bytes: total_bytes,
                 uploaded_bytes: 0,
@@ -361,7 +365,7 @@ impl OffloadClient {
             let req = self
                 .auth(self.http.put(format!("{}/v1/files/chunk", self.base_url)))
                 .query(&[
-                    ("path", remote_path),
+                    ("path", remote_path.as_str()),
                     ("offset", &offset.to_string()),
                     ("total_size", &total_bytes.to_string()),
                 ])
@@ -390,7 +394,7 @@ impl OffloadClient {
         }
 
         Ok(TransferSummary {
-            remote_path: remote_path.to_string(),
+            remote_path,
             total_bytes,
             resumed_bytes,
             uploaded_bytes: total_bytes.saturating_sub(resumed_bytes),
@@ -418,8 +422,9 @@ impl OffloadClient {
     where
         F: FnMut(TransferProgress),
     {
+        let remote_path = normalize_remote_path(remote_path);
         let started = Instant::now();
-        let status = self.file_status(remote_path).await?;
+        let status = self.file_status(&remote_path).await?;
         let total_bytes = status.final_size.ok_or_else(|| ClientError::Api {
             status: StatusCode::NOT_FOUND.as_u16(),
             message: format!("remote file '{remote_path}' does not exist"),
@@ -427,7 +432,7 @@ impl OffloadClient {
 
         if local_matches(local_path, total_bytes, status.blake3.as_deref()).await? {
             return Ok(TransferSummary {
-                remote_path: remote_path.to_string(),
+                remote_path,
                 total_bytes,
                 resumed_bytes: total_bytes,
                 uploaded_bytes: 0,
@@ -468,7 +473,7 @@ impl OffloadClient {
                 self.http
                     .get(format!("{}/v1/files/download", self.base_url)),
             )
-            .query(&[("path", remote_path)]);
+            .query(&[("path", remote_path.as_str())]);
         if offset > 0 && offset < total_bytes {
             req = req.header(header::RANGE, format!("bytes={offset}-"));
         }
@@ -520,7 +525,7 @@ impl OffloadClient {
         fs::rename(&part_path, local_path).await?;
 
         Ok(TransferSummary {
-            remote_path: remote_path.to_string(),
+            remote_path,
             total_bytes,
             resumed_bytes,
             uploaded_bytes: total_bytes.saturating_sub(resumed_bytes),
@@ -606,16 +611,7 @@ async fn discover_nodes(
     socket.set_broadcast(true)?;
 
     let probe_bytes = serde_json::to_vec(&DiscoveryProbe::new()).expect("probe serialize");
-    let bcast = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, discovery_port));
-    let mcast = DISCOVERY_MULTICAST_ADDR
-        .parse::<Ipv4Addr>()
-        .ok()
-        .map(|ip| SocketAddr::V4(SocketAddrV4::new(ip, discovery_port)));
-
-    let _ = socket.send_to(&probe_bytes, bcast).await;
-    if let Some(mcast_addr) = mcast {
-        let _ = socket.send_to(&probe_bytes, mcast_addr).await;
-    }
+    send_discovery_probes(&socket, discovery_port, &probe_bytes).await;
 
     let deadline = Instant::now() + wait;
     let mut seen_urls = HashSet::new();
@@ -650,12 +646,68 @@ async fn discover_nodes(
                     }
                 }
             }
+            Ok(Err(err)) if is_transient_udp_recv_error(&err) => {}
             Ok(Err(err)) => return Err(ClientError::Io(err)),
             Err(_) => break,
         }
     }
 
     Ok(nodes)
+}
+
+/// Sends the discovery probe across every non-loopback IPv4 interface (subnet broadcast +
+/// `IP_MULTICAST_IF`), falling back to global broadcast/multicast. On Windows in particular,
+/// a single `255.255.255.255` or multicast send on `0.0.0.0` only leaves the lowest-metric
+/// adapter (often WSL2/Hyper-V/VPN rather than Wi-Fi).
+async fn send_discovery_probes(socket: &UdpSocket, discovery_port: u16, probe_bytes: &[u8]) {
+    let mut bcast_ips = HashSet::from([Ipv4Addr::BROADCAST]);
+    let mut iface_ips = Vec::new();
+
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            if !iface.is_loopback()
+                && let IfAddr::V4(v4) = iface.addr
+            {
+                let bcast = v4
+                    .broadcast
+                    .unwrap_or_else(|| subnet_broadcast_v4(v4.ip, v4.netmask));
+                bcast_ips.insert(bcast);
+                iface_ips.push(v4.ip);
+            }
+        }
+    }
+
+    for ip in bcast_ips {
+        let addr = SocketAddr::V4(SocketAddrV4::new(ip, discovery_port));
+        let _ = socket.send_to(probe_bytes, addr).await;
+    }
+
+    if let Ok(mcast_ip) = DISCOVERY_MULTICAST_ADDR.parse::<Ipv4Addr>() {
+        let mcast_addr = SocketAddr::V4(SocketAddrV4::new(mcast_ip, discovery_port));
+        if iface_ips.is_empty() {
+            let _ = socket.send_to(probe_bytes, mcast_addr).await;
+        } else {
+            let sock_ref = SockRef::from(socket);
+            for ip in iface_ips {
+                let _ = sock_ref.set_multicast_if_v4(&ip);
+                let _ = socket.send_to(probe_bytes, mcast_addr).await;
+            }
+        }
+    }
+}
+
+fn subnet_broadcast_v4(ip: Ipv4Addr, netmask: Ipv4Addr) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from(ip) | !u32::from(netmask))
+}
+
+fn is_transient_udp_recv_error(err: &io::Error) -> bool {
+    // Winsock surfaces ICMP Port Unreachable from an earlier UDP send as WSAECONNRESET (10054)
+    // on the next recv_from(); keep listening instead of aborting discovery.
+    err.kind() == io::ErrorKind::ConnectionReset
+}
+
+fn normalize_remote_path(remote_path: &str) -> String {
+    remote_path.replace('\\', "/")
 }
 
 /// Progress callbacks fire at most this often (10 Hz), enough for a smooth terminal bar.
@@ -854,5 +906,40 @@ mod tests {
         assert_eq!(final_p.bytes_done, 1000);
         assert_eq!(final_p.eta_secs, Some(0));
         assert!(final_p.speed_bps > 0.0);
+    }
+
+    #[test]
+    fn subnet_broadcast_computes_directed_broadcast() {
+        assert_eq!(
+            subnet_broadcast_v4(
+                Ipv4Addr::new(192, 168, 1, 42),
+                Ipv4Addr::new(255, 255, 255, 0)
+            ),
+            Ipv4Addr::new(192, 168, 1, 255)
+        );
+        assert_eq!(
+            subnet_broadcast_v4(Ipv4Addr::new(10, 0, 5, 12), Ipv4Addr::new(255, 255, 0, 0)),
+            Ipv4Addr::new(10, 0, 255, 255)
+        );
+    }
+
+    #[test]
+    fn transient_udp_recv_error_ignores_connection_reset() {
+        let reset = io::Error::from(io::ErrorKind::ConnectionReset);
+        let refused = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert!(is_transient_udp_recv_error(&reset));
+        assert!(!is_transient_udp_recv_error(&refused));
+    }
+
+    #[test]
+    fn normalize_remote_path_replaces_backslashes() {
+        assert_eq!(
+            normalize_remote_path(r"models\qwen\model.gguf"),
+            "models/qwen/model.gguf"
+        );
+        assert_eq!(
+            normalize_remote_path("models/qwen/model.gguf"),
+            "models/qwen/model.gguf"
+        );
     }
 }

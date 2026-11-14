@@ -11,3 +11,4 @@
 # MSVC debug symbols
 *.pdb
 rustguide.md
+__pycache__

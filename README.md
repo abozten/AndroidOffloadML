@@ -99,11 +99,28 @@ chmod +x offload-server
 
 ### 3. Use it from your host
 
+On macOS / Linux:
+
 ```bash
 export OFFLOAD_TOKEN="your-secret-token"
 
 cargo run -p offload-client -- discover          # list nodes on the LAN
 cargo run -p offload-client -- info              # auto-discovers the first node
+```
+
+On Windows (PowerShell):
+
+```powershell
+$env:OFFLOAD_TOKEN = "your-secret-token"
+
+cargo run -p offload-client -- discover          # list nodes on the LAN
+cargo run -p offload-client -- info              # auto-discovers the first node
+```
+
+Or build a standalone binary (`target\release\offload-client.exe` on Windows):
+
+```bash
+cargo build --release -p offload-client
 ```
 
 Pass `--url http://<phone-ip>:7878` (or set `OFFLOAD_URL`) to skip discovery.
