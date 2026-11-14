@@ -1,0 +1,503 @@
+mod discovery;
+mod files;
+mod runner;
+mod state;
+
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::atomic::Ordering,
+    time::Instant,
+};
+
+use axum::{
+    Json, Router,
+    extract::{DefaultBodyLimit, Path, Request, State},
+    http::{StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post, put},
+};
+use clap::Parser;
+use offload_protocol::{
+    DEFAULT_DISCOVERY_PORT, ErrorResponse, JobRecord, NodeInfo, RunTaskRequest, RunTaskResponse,
+};
+use tracing::{error, info, warn};
+use uuid::Uuid;
+
+use crate::{
+    discovery::{DiscoveryConfig, spawn_discovery_responder},
+    runner::{RunnerError, execute_task},
+    state::{AppState, ServerConfig},
+};
+
+#[derive(Debug, Parser)]
+#[command(name = "offload-server", about = "ML task offload server for Termux/Android")]
+struct Cli {
+    /// Address to bind the HTTP server to (e.g. 0.0.0.0:7878 for LAN)
+    #[arg(long, env = "OFFLOAD_BIND", default_value = "0.0.0.0:7878")]
+    bind: SocketAddr,
+
+    /// Human-readable node name advertised over LAN discovery
+    #[arg(long, env = "OFFLOAD_NODE_NAME", default_value = "oneplus-15")]
+    name: String,
+
+    /// UDP port for LAN discovery probes
+    #[arg(long, env = "OFFLOAD_DISCOVERY_PORT", default_value_t = DEFAULT_DISCOVERY_PORT)]
+    discovery_port: u16,
+
+    /// Disable UDP LAN discovery responder
+    #[arg(long, env = "OFFLOAD_NO_DISCOVERY", default_value_t = false)]
+    no_discovery: bool,
+
+    /// Optional bearer token required on /v1/* endpoints
+    #[arg(long, env = "OFFLOAD_TOKEN")]
+    token: Option<String>,
+
+    /// Maximum number of ML tasks to run concurrently
+    #[arg(long, env = "OFFLOAD_MAX_CONCURRENT", default_value_t = 2)]
+    max_concurrent: usize,
+
+    /// Base directory for GGUF models used by llama_completion tasks
+    #[arg(long, env = "OFFLOAD_MODELS_DIR")]
+    models_dir: Option<PathBuf>,
+
+    /// Directory where resumable file uploads are stored (defaults to --models-dir or ./uploads)
+    #[arg(long, env = "OFFLOAD_FILES_DIR")]
+    files_dir: Option<PathBuf>,
+
+    /// Path or binary name for llama.cpp CLI
+    #[arg(long, env = "OFFLOAD_LLAMA_BIN", default_value = "llama-cli")]
+    llama_bin: String,
+
+    /// Comma-separated allowlist of external commands permitted for `command` tasks
+    #[arg(long, env = "OFFLOAD_ALLOW_CMD", value_delimiter = ',')]
+    allow_cmd: Vec<String>,
+
+    /// Default timeout in seconds for subprocess tasks
+    #[arg(long, env = "OFFLOAD_TIMEOUT_SECS", default_value_t = 300)]
+    default_timeout_secs: u64,
+
+    /// Maximum request body size in megabytes
+    #[arg(long, env = "OFFLOAD_MAX_BODY_MB", default_value_t = 64)]
+    max_body_mb: usize,
+}
+
+#[derive(Debug)]
+struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<RunnerError> for ApiError {
+    fn from(err: RunnerError) -> Self {
+        let status = match err {
+            RunnerError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+            RunnerError::Forbidden(_) => StatusCode::FORBIDDEN,
+            RunnerError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            RunnerError::Process(_) => StatusCode::BAD_GATEWAY,
+            RunnerError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self::new(status, err.to_string())
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(ErrorResponse {
+                error: self.message,
+            }),
+        )
+            .into_response()
+    }
+}
+
+fn build_router(state: AppState, max_body_mb: usize) -> Router {
+    let api_routes = Router::new()
+        .route("/info", get(get_info))
+        .route("/run", post(run_sync))
+        .route("/jobs", post(submit_job).get(list_jobs))
+        .route("/jobs/{id}", get(get_job))
+        .route("/files/status", get(files::file_status))
+        .route("/files/chunk", put(files::upload_chunk))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+    Router::new()
+        .route("/health", get(health))
+        .nest("/v1", api_routes)
+        .layer(DefaultBodyLimit::max(max_body_mb.max(1) * 1024 * 1024))
+        .with_state(state)
+}
+
+async fn auth_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let Some(expected) = state.config.auth_token.as_deref() else {
+        return Ok(next.run(req).await);
+    };
+
+    let auth_header = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    let authorized = auth_header
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|token| token == expected);
+
+    if !authorized {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid bearer token",
+        ));
+    }
+
+    Ok(next.run(req).await)
+}
+
+async fn health() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+async fn get_info(State(state): State<AppState>) -> Json<NodeInfo> {
+    let logical_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    Json(NodeInfo {
+        service: "offload-server".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        logical_cpus,
+        max_concurrent_jobs: state.config.max_concurrent_jobs,
+        active_jobs: state.active_job_count(),
+        models_dir: state
+            .config
+            .models_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        allowed_commands: state.config.allowed_commands.clone(),
+    })
+}
+
+async fn run_sync(
+    State(state): State<AppState>,
+    Json(req): Json<RunTaskRequest>,
+) -> Result<Json<RunTaskResponse>, ApiError> {
+    let permit = state
+        .semaphore
+        .acquire()
+        .await
+        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "worker shutting down"))?;
+
+    state.active_jobs.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    let result = execute_task(req.task, &state.config).await;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    state.active_jobs.fetch_sub(1, Ordering::Relaxed);
+    drop(permit);
+
+    let result = result?;
+    Ok(Json(RunTaskResponse {
+        job_id: Uuid::new_v4(),
+        duration_ms,
+        result,
+    }))
+}
+
+async fn submit_job(
+    State(state): State<AppState>,
+    Json(req): Json<RunTaskRequest>,
+) -> (StatusCode, Json<JobRecord>) {
+    let record = state.create_job().await;
+    let job_id = record.id;
+    let worker_state = state.clone();
+
+    tokio::spawn(async move {
+        let Ok(permit) = worker_state.semaphore.acquire().await else {
+            worker_state
+                .mark_failed(job_id, 0, "worker shutting down".into())
+                .await;
+            return;
+        };
+
+        worker_state.active_jobs.fetch_add(1, Ordering::Relaxed);
+        worker_state.mark_running(job_id).await;
+        let started = Instant::now();
+        let outcome = execute_task(req.task, &worker_state.config).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        worker_state.active_jobs.fetch_sub(1, Ordering::Relaxed);
+        drop(permit);
+
+        match outcome {
+            Ok(res) => worker_state.mark_succeeded(job_id, duration_ms, res).await,
+            Err(err) => {
+                error!(%job_id, error = %err, "async job failed");
+                worker_state
+                    .mark_failed(job_id, duration_ms, err.to_string())
+                    .await;
+            }
+        }
+    });
+
+    (StatusCode::ACCEPTED, Json(record))
+}
+
+async fn get_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<JobRecord>, ApiError> {
+    state
+        .get_job(id)
+        .await
+        .map(Json)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("job {id} not found")))
+}
+
+async fn list_jobs(State(state): State<AppState>) -> Json<Vec<JobRecord>> {
+    Json(state.list_jobs().await)
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "offload_server=info".into()),
+        )
+        .init();
+
+    let cli = Cli::parse();
+    let files_dir = cli
+        .files_dir
+        .or_else(|| cli.models_dir.clone())
+        .unwrap_or_else(|| PathBuf::from("uploads"));
+
+    let config = ServerConfig {
+        auth_token: cli.token.filter(|t| !t.is_empty()),
+        max_concurrent_jobs: cli.max_concurrent.max(1),
+        models_dir: cli.models_dir,
+        files_dir,
+        llama_bin: cli.llama_bin,
+        allowed_commands: cli
+            .allow_cmd
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        default_timeout_secs: cli.default_timeout_secs.max(1),
+    };
+
+    let state = AppState::new(config.clone());
+    let app = build_router(state, cli.max_body_mb);
+
+    let listener = tokio::net::TcpListener::bind(cli.bind)
+        .await
+        .unwrap_or_else(|e| panic!("failed to bind {}: {e}", cli.bind));
+    let http_port = listener
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or_else(|_| cli.bind.port());
+
+    if !cli.no_discovery {
+        let d_cfg = DiscoveryConfig {
+            port: cli.discovery_port,
+            http_port,
+            node_name: cli.name,
+            auth_required: config.auth_token.is_some(),
+        };
+        if let Err(err) = spawn_discovery_responder(d_cfg).await {
+            warn!(error = %err, "failed to start LAN discovery responder");
+        }
+    }
+
+    info!(
+        bind = %cli.bind,
+        max_concurrent = config.max_concurrent_jobs,
+        auth_enabled = config.auth_token.is_some(),
+        models_dir = ?config.models_dir,
+        allowed_commands = ?config.allowed_commands,
+        "offload-server listening"
+    );
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("server failed");
+}
+
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+    info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{body::Body, http::Request as HttpRequest};
+    use offload_protocol::{TaskKind, TaskResult};
+    use tower::ServiceExt;
+
+    use super::*;
+
+    fn test_state(token: Option<&str>) -> AppState {
+        let dir = std::env::temp_dir().join(format!("offload-test-{}", Uuid::new_v4()));
+        AppState::new(ServerConfig {
+            auth_token: token.map(str::to_string),
+            max_concurrent_jobs: 2,
+            models_dir: None,
+            files_dir: dir,
+            llama_bin: "llama-cli".to_string(),
+            allowed_commands: vec![],
+            default_timeout_secs: 30,
+        })
+    }
+
+    #[tokio::test]
+    async fn health_is_open_and_v1_requires_token_when_configured() {
+        let app = build_router(test_state(Some("secret-token")), 16);
+
+        let health_res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health_res.status(), StatusCode::OK);
+
+        let unauth_res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/v1/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth_res.status(), StatusCode::UNAUTHORIZED);
+
+        let auth_res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/v1/info")
+                    .header(header::AUTHORIZATION, "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(auth_res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn run_sync_executes_matmul() {
+        let app = build_router(test_state(None), 16);
+        let req_body = serde_json::to_vec(&RunTaskRequest {
+            task: TaskKind::MatMul {
+                rows_a: 2,
+                cols_a: 2,
+                cols_b: 2,
+                a: vec![1.0, 2.0, 3.0, 4.0],
+                b: vec![5.0, 6.0, 7.0, 8.0],
+            },
+        })
+        .unwrap();
+
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/run")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(req_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let parsed: RunTaskResponse = serde_json::from_slice(&bytes).unwrap();
+        match parsed.result {
+            TaskResult::MatMul { rows, cols, data } => {
+                assert_eq!((rows, cols), (2, 2));
+                assert_eq!(data, vec![19.0, 22.0, 43.0, 50.0]);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_upload_supports_status_and_resume() {
+        let state = test_state(None);
+        let files_dir = state.config.files_dir.clone();
+        let app = build_router(state, 16);
+
+        // Upload first 5 bytes of an 11-byte payload.
+        let put1 = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/v1/files/chunk?path=test.bin&offset=0&total_size=11")
+                    .body(Body::from("hello"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put1.status(), StatusCode::OK);
+
+        // Query status -> should report partial_size=5, exists=false.
+        let st = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/v1/files/status?path=test.bin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let st_bytes = axum::body::to_bytes(st.into_body(), 4096).await.unwrap();
+        let status: offload_protocol::FileTransferStatus =
+            serde_json::from_slice(&st_bytes).unwrap();
+        assert!(!status.exists);
+        assert_eq!(status.partial_size, 5);
+
+        // Resume remaining 6 bytes.
+        let put2 = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/v1/files/chunk?path=test.bin&offset=5&total_size=11")
+                    .body(Body::from(" world"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put2.status(), StatusCode::OK);
+        let content = std::fs::read_to_string(files_dir.join("test.bin")).unwrap();
+        assert_eq!(content, "hello world");
+        let _ = std::fs::remove_dir_all(&files_dir);
+    }
+}

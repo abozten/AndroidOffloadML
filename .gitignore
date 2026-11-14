@@ -1,0 +1,6 @@
+/.agents
+/.cargo
+/Cargo.lock
+/Cargo.toml
+/README.md
+/target
