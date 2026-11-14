@@ -2,12 +2,17 @@ mod discovery;
 mod files;
 mod runner;
 mod state;
+mod telemetry;
 
 use std::{
+    convert::Infallible,
     net::SocketAddr,
     path::PathBuf,
-    sync::atomic::Ordering,
-    time::Instant,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -15,13 +20,19 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post, put},
 };
 use clap::Parser;
 use offload_protocol::{
-    DEFAULT_DISCOVERY_PORT, ErrorResponse, JobRecord, NodeInfo, RunTaskRequest, RunTaskResponse,
+    DEFAULT_DISCOVERY_PORT, ErrorResponse, JobRecord, JobStatus, JobStreamEvent, ModelEntry,
+    NodeInfo, RunTaskRequest, RunTaskResponse,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -126,11 +137,14 @@ impl IntoResponse for ApiError {
 fn build_router(state: AppState, max_body_mb: usize) -> Router {
     let api_routes = Router::new()
         .route("/info", get(get_info))
+        .route("/models", get(list_models))
         .route("/run", post(run_sync))
         .route("/jobs", post(submit_job).get(list_jobs))
-        .route("/jobs/{id}", get(get_job))
+        .route("/jobs/{id}", get(get_job).delete(cancel_job))
+        .route("/jobs/{id}/stream", get(stream_job))
         .route("/files/status", get(files::file_status))
         .route("/files/chunk", put(files::upload_chunk))
+        .route("/files/download", get(files::download_file))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     Router::new()
@@ -172,10 +186,26 @@ async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+struct ActiveJobGuard(Arc<AtomicUsize>);
+
+impl ActiveJobGuard {
+    fn enter(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for ActiveJobGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 async fn get_info(State(state): State<AppState>) -> Json<NodeInfo> {
     let logical_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
+    let tel = telemetry::read_telemetry();
 
     Json(NodeInfo {
         service: "offload-server".to_string(),
@@ -183,6 +213,9 @@ async fn get_info(State(state): State<AppState>) -> Json<NodeInfo> {
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         logical_cpus,
+        mem_total_mb: tel.mem_total_mb,
+        mem_available_mb: tel.mem_available_mb,
+        thermal_c: tel.thermal_c,
         max_concurrent_jobs: state.config.max_concurrent_jobs,
         active_jobs: state.active_job_count(),
         models_dir: state
@@ -192,6 +225,36 @@ async fn get_info(State(state): State<AppState>) -> Json<NodeInfo> {
             .map(|p| p.to_string_lossy().into_owned()),
         allowed_commands: state.config.allowed_commands.clone(),
     })
+}
+
+async fn list_models(State(state): State<AppState>) -> Result<Json<Vec<ModelEntry>>, ApiError> {
+    let Some(dir) = &state.config.models_dir else {
+        return Ok(Json(Vec::new()));
+    };
+    let mut entries = Vec::new();
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Json(Vec::new())),
+        Err(err) => return Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".part") {
+            continue;
+        }
+        entries.push(ModelEntry {
+            name,
+            size_bytes: meta.len(),
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(Json(entries))
 }
 
 async fn run_sync(
@@ -204,11 +267,10 @@ async fn run_sync(
         .await
         .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "worker shutting down"))?;
 
-    state.active_jobs.fetch_add(1, Ordering::Relaxed);
+    let _guard = ActiveJobGuard::enter(state.active_jobs.clone());
     let started = Instant::now();
-    let result = execute_task(req.task, &state.config).await;
+    let result = execute_task(req.task, &state.config, None).await;
     let duration_ms = started.elapsed().as_millis() as u64;
-    state.active_jobs.fetch_sub(1, Ordering::Relaxed);
     drop(permit);
 
     let result = result?;
@@ -223,11 +285,11 @@ async fn submit_job(
     State(state): State<AppState>,
     Json(req): Json<RunTaskRequest>,
 ) -> (StatusCode, Json<JobRecord>) {
-    let record = state.create_job().await;
+    let (record, stream_tx) = state.create_job().await;
     let job_id = record.id;
     let worker_state = state.clone();
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let Ok(permit) = worker_state.semaphore.acquire().await else {
             worker_state
                 .mark_failed(job_id, 0, "worker shutting down".into())
@@ -235,12 +297,11 @@ async fn submit_job(
             return;
         };
 
-        worker_state.active_jobs.fetch_add(1, Ordering::Relaxed);
+        let _guard = ActiveJobGuard::enter(worker_state.active_jobs.clone());
         worker_state.mark_running(job_id).await;
         let started = Instant::now();
-        let outcome = execute_task(req.task, &worker_state.config).await;
+        let outcome = execute_task(req.task, &worker_state.config, Some(stream_tx)).await;
         let duration_ms = started.elapsed().as_millis() as u64;
-        worker_state.active_jobs.fetch_sub(1, Ordering::Relaxed);
         drop(permit);
 
         match outcome {
@@ -254,6 +315,7 @@ async fn submit_job(
         }
     });
 
+    state.set_abort_handle(job_id, handle.abort_handle()).await;
     (StatusCode::ACCEPTED, Json(record))
 }
 
@@ -266,6 +328,61 @@ async fn get_job(
         .await
         .map(Json)
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("job {id} not found")))
+}
+
+async fn cancel_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<JobRecord>, ApiError> {
+    state
+        .cancel_job(id)
+        .await
+        .map(Json)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("job {id} not found")))
+}
+
+async fn stream_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let (record, mut rx) = state
+        .subscribe_job(id)
+        .await
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("job {id} not found")))?;
+
+    let (tx, mpsc_rx) = mpsc::channel::<Result<Event, Infallible>>(64);
+    tokio::spawn(async move {
+        // If already terminal, emit Done immediately and close.
+        if matches!(
+            record.status,
+            JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
+        ) {
+            let done = JobStreamEvent::Done {
+                status: record.status,
+                duration_ms: record.duration_ms,
+                error: record.error,
+            };
+            if let Ok(json) = serde_json::to_string(&done) {
+                let _ = tx.send(Ok(Event::default().data(json))).await;
+            }
+            return;
+        }
+
+        while let Ok(ev) = rx.recv().await {
+            let is_done = matches!(ev, JobStreamEvent::Done { .. });
+            if let Ok(json) = serde_json::to_string(&ev)
+                && tx.send(Ok(Event::default().data(json))).await.is_err()
+            {
+                break;
+            }
+            if is_done {
+                break;
+            }
+        }
+    });
+
+    Ok(Sse::new(ReceiverStream::new(mpsc_rx))
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
 async fn list_jobs(State(state): State<AppState>) -> Json<Vec<JobRecord>> {
@@ -486,6 +603,7 @@ mod tests {
 
         // Resume remaining 6 bytes.
         let put2 = app
+            .clone()
             .oneshot(
                 HttpRequest::builder()
                     .method("PUT")
@@ -498,6 +616,64 @@ mod tests {
         assert_eq!(put2.status(), StatusCode::OK);
         let content = std::fs::read_to_string(files_dir.join("test.bin")).unwrap();
         assert_eq!(content, "hello world");
+
+        // Verify blake3 hash on completed status and Range-resumed download.
+        let st2 = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/v1/files/status?path=test.bin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let st2_bytes = axum::body::to_bytes(st2.into_body(), 4096).await.unwrap();
+        let status2: offload_protocol::FileTransferStatus =
+            serde_json::from_slice(&st2_bytes).unwrap();
+        assert!(status2.exists);
+        assert_eq!(status2.final_size, Some(11));
+        assert_eq!(
+            status2.blake3.as_deref(),
+            Some(blake3::hash(b"hello world").to_hex().as_str())
+        );
+
+        let dl = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/v1/files/download?path=test.bin")
+                    .header(header::RANGE, "bytes=6-")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dl.status(), StatusCode::PARTIAL_CONTENT);
+        let dl_bytes = axum::body::to_bytes(dl.into_body(), 4096).await.unwrap();
+        assert_eq!(&dl_bytes[..], b"world");
+
         let _ = std::fs::remove_dir_all(&files_dir);
+    }
+
+    #[tokio::test]
+    async fn cancel_job_marks_cancelled() {
+        let state = test_state(None);
+        let (record, _) = state.create_job().await;
+        let app = build_router(state, 16);
+
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/jobs/{}", record.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let updated: JobRecord = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated.status, JobStatus::Cancelled);
     }
 }

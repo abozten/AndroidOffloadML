@@ -67,10 +67,23 @@ pub struct NodeInfo {
     pub os: String,
     pub arch: String,
     pub logical_cpus: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_total_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_available_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thermal_c: Option<f32>,
     pub max_concurrent_jobs: usize,
     pub active_jobs: usize,
     pub models_dir: Option<String>,
     pub allowed_commands: Vec<String>,
+}
+
+/// A model file discovered in `--models-dir`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelEntry {
+    pub name: String,
+    pub size_bytes: u64,
 }
 
 /// Request payload for both synchronous (`/v1/run`) and async (`/v1/jobs`) execution.
@@ -177,6 +190,24 @@ pub enum JobStatus {
     Running,
     Succeeded,
     Failed,
+    Cancelled,
+}
+
+/// Live SSE event emitted by `/v1/jobs/{id}/stream`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum JobStreamEvent {
+    Output {
+        stream: String,
+        line: String,
+    },
+    Done {
+        status: JobStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// Full status record for an asynchronous job (`/v1/jobs` and `/v1/jobs/{id}`).
@@ -206,6 +237,8 @@ pub struct FileTransferStatus {
     pub exists: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blake3: Option<String>,
     pub partial_size: u64,
 }
 
@@ -215,4 +248,6 @@ pub struct ChunkUploadResponse {
     pub path: String,
     pub partial_size: u64,
     pub completed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blake3: Option<String>,
 }

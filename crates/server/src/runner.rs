@@ -5,9 +5,14 @@ use std::{
     time::Duration,
 };
 
-use offload_protocol::{SimilarityMatch, TaskKind, TaskResult};
+use offload_protocol::{JobStreamEvent, SimilarityMatch, TaskKind, TaskResult};
 use thiserror::Error;
-use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::Command,
+    sync::broadcast,
+    time::timeout,
+};
 
 use crate::state::ServerConfig;
 
@@ -26,7 +31,11 @@ pub enum RunnerError {
 }
 
 /// Execute a single ML or compute task using the configured worker environment.
-pub async fn execute_task(task: TaskKind, config: &ServerConfig) -> Result<TaskResult, RunnerError> {
+pub async fn execute_task(
+    task: TaskKind,
+    config: &ServerConfig,
+    stream_tx: Option<broadcast::Sender<JobStreamEvent>>,
+) -> Result<TaskResult, RunnerError> {
     match task {
         TaskKind::Echo { payload } => Ok(TaskResult::Echo { payload }),
 
@@ -75,6 +84,7 @@ pub async fn execute_task(task: TaskKind, config: &ServerConfig) -> Result<TaskR
                 &args,
                 None,
                 Duration::from_secs(config.default_timeout_secs),
+                stream_tx,
             )
             .await
         }
@@ -96,6 +106,7 @@ pub async fn execute_task(task: TaskKind, config: &ServerConfig) -> Result<TaskR
                 &args,
                 stdin.as_deref(),
                 Duration::from_secs(secs),
+                stream_tx,
             )
             .await
         }
@@ -251,6 +262,7 @@ async fn run_subprocess(
     args: &[String],
     stdin_data: Option<&str>,
     limit: Duration,
+    stream_tx: Option<broadcast::Sender<JobStreamEvent>>,
 ) -> Result<TaskResult, RunnerError> {
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -277,21 +289,66 @@ async fn run_subprocess(
         });
     }
 
-    let output = timeout(limit, child.wait_with_output())
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    let tx_out = stream_tx.clone();
+    let out_task = tokio::spawn(async move {
+        let mut collected = String::new();
+        if let Some(pipe) = stdout_pipe {
+            let mut lines = BufReader::new(pipe).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(tx) = &tx_out {
+                    let _ = tx.send(JobStreamEvent::Output {
+                        stream: "stdout".to_string(),
+                        line: line.clone(),
+                    });
+                }
+                if !collected.is_empty() {
+                    collected.push('\n');
+                }
+                collected.push_str(&line);
+            }
+        }
+        collected
+    });
+
+    let tx_err = stream_tx;
+    let err_task = tokio::spawn(async move {
+        let mut collected = String::new();
+        if let Some(pipe) = stderr_pipe {
+            let mut lines = BufReader::new(pipe).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(tx) = &tx_err {
+                    let _ = tx.send(JobStreamEvent::Output {
+                        stream: "stderr".to_string(),
+                        line: line.clone(),
+                    });
+                }
+                if !collected.is_empty() {
+                    collected.push('\n');
+                }
+                collected.push_str(&line);
+            }
+        }
+        collected
+    });
+
+    let status = timeout(limit, child.wait())
         .await
         .map_err(|_| RunnerError::Timeout(limit.as_secs()))?
         .map_err(|e| RunnerError::Process(format!("failed waiting on '{program}': {e}")))?;
 
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr_raw = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = out_task.await.unwrap_or_default();
+    let stderr_raw = err_task.await.unwrap_or_default();
+    let exit_code = status.code().unwrap_or(-1);
     let stderr = if stderr_raw.trim().is_empty() {
         None
     } else {
         Some(stderr_raw)
     };
 
-    if !output.status.success() {
+    if !status.success() {
         return Err(RunnerError::Process(format!(
             "'{program}' exited with code {exit_code}: {}",
             stderr.as_deref().unwrap_or("no stderr")

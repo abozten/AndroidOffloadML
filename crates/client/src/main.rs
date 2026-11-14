@@ -6,7 +6,7 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use offload_client::{OffloadClient, TransferProgress};
-use offload_protocol::{DEFAULT_DISCOVERY_PORT, TaskKind};
+use offload_protocol::{DEFAULT_DISCOVERY_PORT, JobStreamEvent, TaskKind};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -39,6 +39,9 @@ enum Commands {
     /// Check server health and print worker hardware/capability info
     Info,
 
+    /// List models available in the server's --models-dir
+    Models,
+
     /// Send an echo payload to measure round-trip latency
     Echo {
         #[arg(default_value = "hello-oneplus-15")]
@@ -63,6 +66,8 @@ enum Commands {
         temp: Option<f32>,
         #[arg(long)]
         r#async: bool,
+        #[arg(long)]
+        stream: bool,
     },
 
     /// Run an allowlisted external ML command on the device
@@ -71,12 +76,20 @@ enum Commands {
         program: String,
         #[arg(long)]
         r#async: bool,
+        #[arg(long)]
+        stream: bool,
         #[arg(last = true)]
         args: Vec<String>,
     },
 
     /// Fetch status of an async job by UUID
     Job { id: Uuid },
+
+    /// Cancel a queued or running async job by UUID
+    Cancel { id: Uuid },
+
+    /// Stream live output of an async job by UUID
+    Stream { id: Uuid },
 
     /// List recent async jobs on the server
     Jobs,
@@ -91,6 +104,15 @@ enum Commands {
         /// Chunk size in MiB
         #[arg(long, default_value_t = 4)]
         chunk_mb: usize,
+    },
+
+    /// Download a file from the server's --files-dir with Range resume and speed/ETA progress
+    Pull {
+        /// Remote relative path under the server's --files-dir
+        remote_path: String,
+        /// Local destination path (defaults to filename in current directory)
+        #[arg(long)]
+        to: Option<PathBuf>,
     },
 }
 
@@ -133,6 +155,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&info)?);
         }
 
+        Commands::Models => {
+            let models = client.list_models().await?;
+            println!("{}", serde_json::to_string_pretty(&models)?);
+        }
+
         Commands::Echo { message } => {
             let started = Instant::now();
             let res = client
@@ -172,6 +199,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_tokens,
             temp,
             r#async,
+            stream,
         } => {
             let task = TaskKind::LlamaCompletion {
                 model,
@@ -180,12 +208,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 temperature: temp,
                 extra_args: vec![],
             };
-            execute_cli_task(&client, task, r#async).await?;
+            execute_cli_task(&client, task, r#async, stream).await?;
         }
 
         Commands::Cmd {
             program,
             r#async,
+            stream,
             args,
         } => {
             let task = TaskKind::Command {
@@ -194,12 +223,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 stdin: None,
                 timeout_secs: None,
             };
-            execute_cli_task(&client, task, r#async).await?;
+            execute_cli_task(&client, task, r#async, stream).await?;
         }
 
         Commands::Job { id } => {
             let job = client.job_status(id).await?;
             println!("{}", serde_json::to_string_pretty(&job)?);
+        }
+
+        Commands::Cancel { id } => {
+            let job = client.cancel_job(id).await?;
+            println!("{}", serde_json::to_string_pretty(&job)?);
+        }
+
+        Commands::Stream { id } => {
+            stream_to_console(&client, id).await?;
         }
 
         Commands::Jobs => {
@@ -239,8 +277,89 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+
+        Commands::Pull { remote_path, to } => {
+            let local_path = match to {
+                Some(p) => p,
+                None => {
+                    let name = PathBuf::from(&remote_path)
+                        .file_name()
+                        .map(PathBuf::from)
+                        .ok_or("remote_path has no filename")?;
+                    name
+                }
+            };
+            let summary = client
+                .download_file(&remote_path, &local_path, render_progress)
+                .await?;
+            if summary.already_existed {
+                println!(
+                    "already up to date: {} ({})",
+                    local_path.display(),
+                    format_bytes(summary.total_bytes as f64)
+                );
+            } else {
+                eprintln!();
+                let avg_bps = summary.uploaded_bytes as f64 / summary.elapsed.as_secs_f64().max(1e-4);
+                println!(
+                    "downloaded {} ({}, resumed {}, avg {}/s in {:.2}s)",
+                    local_path.display(),
+                    format_bytes(summary.total_bytes as f64),
+                    format_bytes(summary.resumed_bytes as f64),
+                    format_bytes(avg_bps),
+                    summary.elapsed.as_secs_f64()
+                );
+            }
+        }
     }
 
+    Ok(())
+}
+
+async fn execute_cli_task(
+    client: &OffloadClient,
+    task: TaskKind,
+    use_async: bool,
+    stream: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if stream {
+        let job = client.submit(task).await?;
+        eprintln!("job_id={}", job.id);
+        stream_to_console(client, job.id).await?;
+    } else if use_async {
+        let record = client
+            .run_and_wait(task, Duration::from_millis(500))
+            .await?;
+        println!("{}", serde_json::to_string_pretty(&record)?);
+    } else {
+        let res = client.run(task).await?;
+        println!("{}", serde_json::to_string_pretty(&res)?);
+    }
+    Ok(())
+}
+
+async fn stream_to_console(
+    client: &OffloadClient,
+    id: Uuid,
+) -> Result<(), Box<dyn std::error::Error>> {
+    client
+        .stream_job(id, |ev| match ev {
+            JobStreamEvent::Output { stream, line } => {
+                if stream == "stderr" {
+                    eprintln!("[stderr] {line}");
+                } else {
+                    println!("{line}");
+                }
+            }
+            JobStreamEvent::Done {
+                status,
+                duration_ms,
+                error,
+            } => {
+                eprintln!("[done] status={status:?} duration_ms={duration_ms:?} error={error:?}");
+            }
+        })
+        .await?;
     Ok(())
 }
 
@@ -302,21 +421,4 @@ fn format_eta(secs: u64) -> String {
     } else {
         format!("{mins:02}:{rem:02}")
     }
-}
-
-async fn execute_cli_task(
-    client: &OffloadClient,
-    task: TaskKind,
-    use_async: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if use_async {
-        let record = client
-            .run_and_wait(task, Duration::from_millis(500))
-            .await?;
-        println!("{}", serde_json::to_string_pretty(&record)?);
-    } else {
-        let res = client.run(task).await?;
-        println!("{}", serde_json::to_string_pretty(&res)?);
-    }
-    Ok(())
 }

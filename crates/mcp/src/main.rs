@@ -249,6 +249,41 @@ fn tool_definitions() -> Value {
                     "chunk_mb": { "type": "integer", "default": 4 }
                 }
             }
+        },
+        {
+            "name": "pull_file",
+            "description": "Download a file from the phone's --files-dir with Range resume and BLAKE3 verification.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["remote_path", "local_path"],
+                "properties": {
+                    "url": { "type": "string" },
+                    "remote_path": { "type": "string" },
+                    "local_path": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "list_models",
+            "description": "List GGUF/model files available in the phone's --models-dir.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "cancel_job",
+            "description": "Cancel a queued or running async job by UUID.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["id"],
+                "properties": {
+                    "url": { "type": "string" },
+                    "id": { "type": "string" }
+                }
+            }
         }
     ])
 }
@@ -405,6 +440,45 @@ async fn call_tool(cli: &Cli, name: &str, args: Value) -> Result<Value, String> 
                 "already_existed": summary.already_existed,
             }))
         }
+        "pull_file" => {
+            let client = resolve_client(cli, explicit_url).await?;
+            let remote_path = args
+                .get("remote_path")
+                .and_then(Value::as_str)
+                .ok_or("missing required 'remote_path'")?;
+            let local_path = args
+                .get("local_path")
+                .and_then(Value::as_str)
+                .ok_or("missing required 'local_path'")?;
+            let summary = client
+                .download_file(remote_path, Path::new(local_path), |_| {})
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({
+                "remote_path": summary.remote_path,
+                "local_path": local_path,
+                "total_bytes": summary.total_bytes,
+                "resumed_bytes": summary.resumed_bytes,
+                "downloaded_bytes": summary.uploaded_bytes,
+                "elapsed_secs": summary.elapsed.as_secs_f64(),
+                "already_existed": summary.already_existed,
+            }))
+        }
+        "list_models" => {
+            let client = resolve_client(cli, explicit_url).await?;
+            let models = client.list_models().await.map_err(|e| e.to_string())?;
+            serde_json::to_value(models).map_err(|e| e.to_string())
+        }
+        "cancel_job" => {
+            let client = resolve_client(cli, explicit_url).await?;
+            let id_str = args
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("missing required 'id'")?;
+            let id = Uuid::parse_str(id_str).map_err(|e| format!("invalid UUID: {e}"))?;
+            let job = client.cancel_job(id).await.map_err(|e| e.to_string())?;
+            serde_json::to_value(job).map_err(|e| e.to_string())
+        }
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -431,6 +505,6 @@ mod tests {
         let list = handle_request(&cli, json!(2), "tools/list", json!({})).await;
         assert!(list.error.is_none());
         let tools = list.result.unwrap()["tools"].as_array().unwrap().len();
-        assert_eq!(tools, 7);
+        assert_eq!(tools, 10);
     }
 }

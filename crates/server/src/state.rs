@@ -8,11 +8,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use offload_protocol::{JobRecord, JobStatus};
-use tokio::sync::{RwLock, Semaphore};
+use offload_protocol::{JobRecord, JobStatus, JobStreamEvent, TaskResult};
+use tokio::{
+    sync::{RwLock, Semaphore, broadcast},
+    task::AbortHandle,
+};
 use uuid::Uuid;
 
 const MAX_RETAINED_JOBS: usize = 200;
+const STREAM_CHANNEL_CAPACITY: usize = 256;
 
 /// Runtime configuration for the offload server.
 #[derive(Debug, Clone)]
@@ -35,9 +39,15 @@ pub struct AppState {
     jobs: Arc<RwLock<JobStore>>,
 }
 
+struct JobEntry {
+    record: JobRecord,
+    tx: broadcast::Sender<JobStreamEvent>,
+    abort_handle: Option<AbortHandle>,
+}
+
 #[derive(Default)]
 struct JobStore {
-    records: HashMap<Uuid, JobRecord>,
+    entries: HashMap<Uuid, JobEntry>,
     order: VecDeque<Uuid>,
 }
 
@@ -56,7 +66,7 @@ impl AppState {
         self.active_jobs.load(Ordering::Relaxed)
     }
 
-    pub async fn create_job(&self) -> JobRecord {
+    pub async fn create_job(&self) -> (JobRecord, broadcast::Sender<JobStreamEvent>) {
         let id = Uuid::new_v4();
         let record = JobRecord {
             id,
@@ -66,53 +76,110 @@ impl AppState {
             result: None,
             error: None,
         };
+        let (tx, _) = broadcast::channel(STREAM_CHANNEL_CAPACITY);
 
         let mut store = self.jobs.write().await;
-        store.records.insert(id, record.clone());
+        store.entries.insert(
+            id,
+            JobEntry {
+                record: record.clone(),
+                tx: tx.clone(),
+                abort_handle: None,
+            },
+        );
         store.order.push_back(id);
         while store.order.len() > MAX_RETAINED_JOBS {
             if let Some(oldest) = store.order.pop_front() {
-                store.records.remove(&oldest);
+                store.entries.remove(&oldest);
             }
         }
-        record
+        (record, tx)
+    }
+
+    pub async fn set_abort_handle(&self, id: Uuid, handle: AbortHandle) {
+        let mut store = self.jobs.write().await;
+        if let Some(entry) = store.entries.get_mut(&id) {
+            entry.abort_handle = Some(handle);
+        }
     }
 
     pub async fn mark_running(&self, id: Uuid) {
         let mut store = self.jobs.write().await;
-        if let Some(job) = store.records.get_mut(&id) {
-            job.status = JobStatus::Running;
+        if let Some(entry) = store.entries.get_mut(&id)
+            && entry.record.status == JobStatus::Queued
+        {
+            entry.record.status = JobStatus::Running;
         }
     }
 
-    pub async fn mark_succeeded(
-        &self,
-        id: Uuid,
-        duration_ms: u64,
-        result: offload_protocol::TaskResult,
-    ) {
+    pub async fn mark_succeeded(&self, id: Uuid, duration_ms: u64, result: TaskResult) {
         let mut store = self.jobs.write().await;
-        if let Some(job) = store.records.get_mut(&id) {
-            job.status = JobStatus::Succeeded;
-            job.duration_ms = Some(duration_ms);
-            job.result = Some(result);
-            job.error = None;
+        if let Some(entry) = store.entries.get_mut(&id) {
+            entry.record.status = JobStatus::Succeeded;
+            entry.record.duration_ms = Some(duration_ms);
+            entry.record.result = Some(result);
+            entry.record.error = None;
+            entry.abort_handle = None;
+            let _ = entry.tx.send(JobStreamEvent::Done {
+                status: JobStatus::Succeeded,
+                duration_ms: Some(duration_ms),
+                error: None,
+            });
         }
     }
 
     pub async fn mark_failed(&self, id: Uuid, duration_ms: u64, error: String) {
         let mut store = self.jobs.write().await;
-        if let Some(job) = store.records.get_mut(&id) {
-            job.status = JobStatus::Failed;
-            job.duration_ms = Some(duration_ms);
-            job.result = None;
-            job.error = Some(error);
+        if let Some(entry) = store.entries.get_mut(&id) {
+            entry.record.status = JobStatus::Failed;
+            entry.record.duration_ms = Some(duration_ms);
+            entry.record.result = None;
+            entry.record.error = Some(error.clone());
+            entry.abort_handle = None;
+            let _ = entry.tx.send(JobStreamEvent::Done {
+                status: JobStatus::Failed,
+                duration_ms: Some(duration_ms),
+                error: Some(error),
+            });
         }
+    }
+
+    /// Cancel a queued or running job and abort its background task.
+    pub async fn cancel_job(&self, id: Uuid) -> Option<JobRecord> {
+        let mut store = self.jobs.write().await;
+        let entry = store.entries.get_mut(&id)?;
+        match entry.record.status {
+            JobStatus::Queued | JobStatus::Running => {
+                if let Some(handle) = entry.abort_handle.take() {
+                    handle.abort();
+                }
+                entry.record.status = JobStatus::Cancelled;
+                entry.record.error = Some("cancelled by client".to_string());
+                let _ = entry.tx.send(JobStreamEvent::Done {
+                    status: JobStatus::Cancelled,
+                    duration_ms: None,
+                    error: entry.record.error.clone(),
+                });
+            }
+            JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled => {}
+        }
+        Some(entry.record.clone())
     }
 
     pub async fn get_job(&self, id: Uuid) -> Option<JobRecord> {
         let store = self.jobs.read().await;
-        store.records.get(&id).cloned()
+        store.entries.get(&id).map(|e| e.record.clone())
+    }
+
+    pub async fn subscribe_job(
+        &self,
+        id: Uuid,
+    ) -> Option<(JobRecord, broadcast::Receiver<JobStreamEvent>)> {
+        let store = self.jobs.read().await;
+        store
+            .entries
+            .get(&id)
+            .map(|e| (e.record.clone(), e.tx.subscribe()))
     }
 
     pub async fn list_jobs(&self) -> Vec<JobRecord> {
@@ -121,7 +188,7 @@ impl AppState {
             .order
             .iter()
             .rev()
-            .filter_map(|id| store.records.get(id).cloned())
+            .filter_map(|id| store.entries.get(id).map(|e| e.record.clone()))
             .collect()
     }
 }
